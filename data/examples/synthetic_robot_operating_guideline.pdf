@@ -1,0 +1,64 @@
+%PDF-1.3
+%‚„œ”
+1 0 obj
+<<
+/Producer (pypdf)
+/Title (Synthetic Robot Operating Guideline)
+/Author (AURA synthetic demo fixture)
+>>
+endobj
+2 0 obj
+<<
+/Type /Pages
+/Count 1
+/Kids [ 4 0 R ]
+>>
+endobj
+3 0 obj
+<<
+/Type /Catalog
+/Pages 2 0 R
+>>
+endobj
+4 0 obj
+<<
+/Type /Page
+/Resources <<
+/Font <<
+/F1 <<
+/Type /Font
+/Subtype /Type1
+/BaseFont /Helvetica
+>>
+>>
+>>
+/MediaBox [ 0.0 0.0 612 792 ]
+/Parent 2 0 R
+/Contents 5 0 R
+>>
+endobj
+5 0 obj
+<<
+/Length 675
+>>
+stream
+BT /F1 12 Tf 72 750 Td (SYNTHETIC ROBOT OPERATING GUIDELINE) Tj 0 -28 Td (Fictional retrieval-demo content; not an approved safety procedure.) Tj 0 -28 Td (Before a pick operation, confirm the task is authorized.) Tj 0 -28 Td (Verify the workspace is clear and the target is identified) Tj 0 -28 Td (in the approved task plan.) Tj 0 -28 Td (Confirm the gripper state is appropriate for the task.) Tj 0 -28 Td (Keep the emergency stop accessible and protective guards) Tj 0 -28 Td (or interlocks active.) Tj 0 -28 Td (If any prerequisite is uncertain, stop and request qualified review.) Tj 0 -28 Td (This sample defines no motion, speed, force, or deployment commands.) Tj ET
+endstream
+endobj
+xref
+0 6
+0000000000 65535 f 
+0000000015 00000 n 
+0000000137 00000 n 
+0000000196 00000 n 
+0000000245 00000 n 
+0000000426 00000 n 
+trailer
+<<
+/Size 6
+/Root 3 0 R
+/Info 1 0 R
+>>
+startxref
+1152
+%%EOF

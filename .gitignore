@@ -218,3 +218,19 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# AURA local state and generated private data
+data/aura.db
+data/aura.db-*
+data/vector_store/
+data/models/
+data/media/*
+!data/media/.gitkeep
+output/reports/*
+!output/reports/.gitkeep
+output/exports/*
+!output/exports/.gitkeep
+frontend/node_modules/
+frontend/dist/
+*.sqlite3
+*.sqlite3-*

@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "aura-robotics-data-platform"
+version = "0.1.0"
+description = "Local-first robotics demonstration annotation and review platform"
+requires-python = ">=3.11"
+dependencies = [
+  "Django>=5.1,<6",
+  "django-cors-headers>=4.4,<5",
+  "pypdf>=5,<7",
+]
+
+[project.optional-dependencies]
+postgres = ["psycopg[binary]>=3.2,<4"]
+rag = [
+  "chromadb>=0.6,<2",
+  "sentence-transformers>=3,<6",
+]
+
+[project.scripts]
+annotation-processor = "annotation_processor.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src", "backend"]
+
+[tool.setuptools.package-dir]
+"" = "src"
+aura_api = "backend/aura_api"
