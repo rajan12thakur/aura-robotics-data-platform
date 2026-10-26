@@ -1,0 +1,457 @@
+import hashlib
+import io
+import json
+import tempfile
+from pathlib import Path
+from unittest.mock import patch
+
+from django.contrib.auth.models import Group, User
+from django.core.files.uploadedfile import SimpleUploadedFile
+from django.test import Client, TestCase
+from pypdf import PdfWriter
+from pypdf.generic import DecodedStreamObject, DictionaryObject, NameObject
+
+from . import views
+from .models import (
+    Annotation, AnnotationRevision, DatasetExport, KnowledgeChunk, KnowledgeConversation,
+    KnowledgeSource, Project, RLExperiment, Video,
+)
+from .rl import GridPickPlace, run_experiment
+
+
+class AuraApiTests(TestCase):
+    def setUp(self):
+        self.annotator = User.objects.create_user(username="annotator", password="test-password")
+        Group.objects.get_or_create(name="Annotator")
+        self.annotator.groups.add(Group.objects.get(name="Annotator"))
+        self.client.force_login(self.annotator)
+        self.project = Project.objects.create(name="Test project")
+        self.video = Video.objects.create(
+            project=self.project, original_filename="test.mp4", duration_seconds=20, status="metadata_ready",
+        )
+
+    def post_json(self, path, data):
+        return self.client.post(path, data=json.dumps(data), content_type="application/json")
+
+    def make_pdf(self, text="Before a pick, verify the gripper is open and the workspace is clear.", password=None):
+        writer = PdfWriter()
+        page = writer.add_blank_page(width=612, height=792)
+        if text is not None:
+            font = DictionaryObject({
+                NameObject("/Type"): NameObject("/Font"),
+                NameObject("/Subtype"): NameObject("/Type1"),
+                NameObject("/BaseFont"): NameObject("/Helvetica"),
+            })
+            resources = DictionaryObject({
+                NameObject("/Font"): DictionaryObject({NameObject("/F1"): font}),
+            })
+            stream = DecodedStreamObject()
+            escaped = text.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
+            stream.set_data(f"BT /F1 12 Tf 72 720 Td ({escaped}) Tj ET".encode("latin-1"))
+            page[NameObject("/Resources")] = resources
+            page[NameObject("/Contents")] = writer._add_object(stream)
+        if password:
+            writer.encrypt(password)
+        output = io.BytesIO()
+        writer.write(output)
+        return output.getvalue()
+
+    def test_unauthenticated_api_request_is_rejected(self):
+        response = Client().get("/api/v1/projects")
+        self.assertEqual(response.status_code, 401)
+        self.assertEqual(response.json()["error"]["code"], "AUTHENTICATION_REQUIRED")
+
+    def test_health_and_readiness_are_public_diagnostics(self):
+        client = Client()
+        self.assertEqual(client.get("/api/v1/health").status_code, 200)
+        self.assertEqual(client.get("/api/v1/health/ready").status_code, 200)
+
+    def test_grid_environment_has_defined_success_and_invalid_action_rewards(self):
+        env = GridPickPlace(max_steps=10)
+        self.assertEqual(env.reset(), (0, 2, 0))
+        state, reward, done, info = env.step("up")
+        self.assertEqual((state, reward, done, info["event"]), ((0, 2, 0), -1.0, False, "boundary"))
+        for action in ("right", "right", "pick", "down", "down", "place"):
+            state, reward, done, _ = env.step(action)
+        self.assertEqual(state, (8, 8, 0))
+        self.assertEqual(reward, 19.9)
+        self.assertTrue(done)
+
+    def test_q_learning_is_reproducible_and_evaluated_against_baseline(self):
+        first = run_experiment("q_learning", episodes=100, seed=123, max_steps=30)
+        second = run_experiment("q_learning", episodes=100, seed=123, max_steps=30)
+        self.assertEqual(first["metrics"], second["metrics"])
+        self.assertEqual(first["policy"], second["policy"])
+        self.assertEqual(first["metrics"]["evaluation"]["baseline_policy"]["success_rate"], 1.0)
+        self.assertEqual(first["metrics"]["evaluation"]["learned_policy"]["episode_count"], 20)
+        self.assertTrue(first["policy"])
+
+    def test_video_knowledge_is_persisted_and_cites_actual_annotations(self):
+        for index, action in enumerate(("approach", "grasp", "place")):
+            Annotation.objects.create(
+                project=self.project, video=self.video, start_time=float(index),
+                end_time=float(index + 1), action_label=action, status="approved",
+            )
+        indexed = self.client.post(f"/api/v1/videos/{self.video.id}/knowledge/index")
+        self.assertEqual(indexed.status_code, 200)
+        source = KnowledgeSource.objects.get(pk=indexed.json()["id"])
+        self.assertEqual(source.status, "indexed")
+        self.assertEqual(source.chunk_count, 4)
+        self.assertIn("stored video metadata and database annotations", source.metadata_json)
+        self.assertIn("Video pixels are unavailable", source.warnings_json)
+
+        conversation = self.post_json(
+            f"/api/v1/projects/{self.project.id}/knowledge/conversations",
+            {"video_id": self.video.id, "scope": "selected_video", "source_ids": []},
+        )
+        self.assertEqual(conversation.status_code, 201)
+        response = self.post_json(
+            f"/api/v1/knowledge/conversations/{conversation.json()['id']}/messages",
+            {"question": "List the actions recorded for this video in chronological order."},
+        )
+        self.assertEqual(response.status_code, 201)
+        citations = response.json()["citations"]
+        actual_ids = list(Annotation.objects.filter(video=self.video).order_by("start_time").values_list("id", flat=True))
+        self.assertEqual([citation["annotation_id"] for citation in citations], actual_ids)
+        self.assertTrue(all(citation["start_seconds"] is not None for citation in citations))
+        self.assertEqual(response.json()["retrieval"]["method"], "structured_video_annotations")
+        self.assertIn("not visual inspection", response.json()["answer"])
+        persisted = self.client.get(f"/api/v1/knowledge/conversations/{conversation.json()['id']}")
+        self.assertEqual(len(persisted.json()["messages"]), 2)
+
+    def test_pdf_upload_citation_scope_abstention_duplicate_and_deletion(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        with patch("aura_api.views.MEDIA_DIR", Path(temporary.name)), patch(
+            "aura_api.knowledge_service.MEDIA_DIR", Path(temporary.name),
+        ):
+            content = self.make_pdf()
+            upload = SimpleUploadedFile("robot-guideline.pdf", content, content_type="application/pdf")
+            response = self.client.post(f"/api/v1/projects/{self.project.id}/knowledge/sources", {"file": upload})
+            self.assertEqual(response.status_code, 201, response.content)
+            source = KnowledgeSource.objects.get(pk=response.json()["id"])
+            self.assertEqual(source.status, "indexed")
+            self.assertEqual(source.page_count, 1)
+            self.assertEqual(source.index_backend, "lexical_sqlite")
+            self.assertIsNone(source.embedding_dimensions)
+            self.assertEqual(source.checksum_sha256, hashlib.sha256(content).hexdigest())
+            chunk = source.chunks.get()
+            self.assertEqual((chunk.page_start, chunk.page_end), (1, 1))
+            self.assertIn("workspace is clear", chunk.content)
+
+            duplicate = SimpleUploadedFile("duplicate.pdf", content, content_type="application/pdf")
+            duplicate_response = self.client.post(f"/api/v1/projects/{self.project.id}/knowledge/sources", {"file": duplicate})
+            self.assertEqual(duplicate_response.status_code, 409)
+
+            foreign_project = Project.objects.create(name="Other project")
+            foreign_source = KnowledgeSource.objects.create(
+                project=foreign_project, source_type="pdf", title="private.pdf",
+                checksum_sha256="f" * 64, status="indexed", chunk_count=1,
+            )
+            KnowledgeChunk.objects.create(
+                id="e" * 64, source=foreign_source, chunk_index=0, source_type="pdf",
+                content="Orbit-only secret phrase from another project",
+                content_sha256="d" * 64,
+            )
+            wrong_scope = self.post_json(
+                f"/api/v1/projects/{self.project.id}/knowledge/conversations",
+                {"scope": "documents_only", "source_ids": [foreign_source.id]},
+            )
+            self.assertEqual(wrong_scope.status_code, 404)
+
+            created = self.post_json(
+                f"/api/v1/projects/{self.project.id}/knowledge/conversations",
+                {"scope": "documents_only", "source_ids": [source.id]},
+            )
+            self.assertEqual(created.status_code, 201)
+            conversation_id = created.json()["id"]
+            grounded = self.post_json(
+                f"/api/v1/knowledge/conversations/{conversation_id}/messages",
+                {"question": "What should be verified before a pick?"},
+            )
+            self.assertEqual(grounded.status_code, 201)
+            citation = grounded.json()["citations"][0]
+            self.assertEqual(citation["page_start"], 1)
+            self.assertEqual(citation["source_id"], source.id)
+            self.assertGreater(citation["score"], 0)
+            self.assertEqual(grounded.json()["answer_mode"], "deterministic_extractive")
+
+            abstained = self.post_json(
+                f"/api/v1/knowledge/conversations/{conversation_id}/messages",
+                {"question": "What is the capital of France?"},
+            )
+            self.assertEqual(abstained.json()["evidence_status"], "insufficient_evidence")
+            self.assertEqual(abstained.json()["citations"], [])
+
+            admin_group, _ = Group.objects.get_or_create(name="Administrator")
+            self.annotator.groups.add(admin_group)
+            deleted = self.client.delete(f"/api/v1/knowledge/sources/{source.id}/lifecycle")
+            self.assertEqual(deleted.status_code, 200)
+            self.assertEqual(KnowledgeChunk.objects.filter(source=source).count(), 0)
+            self.assertEqual(KnowledgeSource.objects.get(pk=source.id).status, "deleted")
+            self.assertEqual(self.client.get(f"/api/v1/projects/{self.project.id}/knowledge/sources").json(), [])
+            old_conversation = self.client.get(f"/api/v1/knowledge/conversations/{conversation_id}").json()
+            stored_citation = old_conversation["messages"][1]["citations"][0]
+            self.assertTrue(stored_citation["stale"])
+
+    def test_pdf_failure_states_and_reindex_are_persisted_without_duplicate_chunks(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        with patch("aura_api.views.MEDIA_DIR", Path(temporary.name)), patch(
+            "aura_api.knowledge_service.MEDIA_DIR", Path(temporary.name),
+        ):
+            upload = SimpleUploadedFile("guideline.pdf", self.make_pdf(), content_type="application/pdf")
+            response = self.client.post(f"/api/v1/projects/{self.project.id}/knowledge/sources", {"file": upload})
+            source_id = response.json()["id"]
+            source = KnowledgeSource.objects.get(pk=source_id)
+            initial_ids = list(source.chunks.values_list("id", flat=True))
+            retried = self.client.post(f"/api/v1/knowledge/sources/{source_id}/lifecycle")
+            self.assertEqual(retried.status_code, 200)
+            updated_source = KnowledgeSource.objects.get(pk=source_id)
+            self.assertEqual(updated_source.chunk_count, 1)
+            self.assertEqual(updated_source.source_version, 2)
+            new_ids = list(KnowledgeChunk.objects.filter(source_id=source_id).values_list("id", flat=True))
+            self.assertEqual(len(new_ids), 1)
+            self.assertNotEqual(new_ids, initial_ids)
+            self.assertEqual(source.jobs.count(), 2)
+
+            encrypted = SimpleUploadedFile(
+                "encrypted.pdf", self.make_pdf(password="secret"), content_type="application/pdf",
+            )
+            encrypted_response = self.client.post(
+                f"/api/v1/projects/{self.project.id}/knowledge/sources", {"file": encrypted},
+            )
+            encrypted_source = KnowledgeSource.objects.get(pk=encrypted_response.json()["id"])
+            self.assertEqual(encrypted_source.status, "failed")
+            self.assertIn("encrypted", encrypted_source.error_summary)
+
+            scanned = SimpleUploadedFile(
+                "scanned.pdf", self.make_pdf(text=None), content_type="application/pdf",
+            )
+            scanned_response = self.client.post(
+                f"/api/v1/projects/{self.project.id}/knowledge/sources", {"file": scanned},
+            )
+            scanned_source = KnowledgeSource.objects.get(pk=scanned_response.json()["id"])
+            self.assertEqual(scanned_source.status, "partially_indexed")
+            self.assertEqual(scanned_source.chunk_count, 0)
+            self.assertIn("OCR is not configured", scanned_source.warnings_json)
+
+            corrupt = SimpleUploadedFile(
+                "corrupt.pdf", b"%PDF-1.4\ninvalid structure", content_type="application/pdf",
+            )
+            corrupt_response = self.client.post(
+                f"/api/v1/projects/{self.project.id}/knowledge/sources", {"file": corrupt},
+            )
+            corrupt_source = KnowledgeSource.objects.get(pk=corrupt_response.json()["id"])
+            self.assertEqual(corrupt_source.status, "failed")
+            self.assertIn("could not be read", corrupt_source.error_summary)
+
+    def test_invalid_pdf_signature_is_rejected_before_storage(self):
+        invalid = SimpleUploadedFile("not-really.pdf", b"not a pdf", content_type="application/pdf")
+        response = self.client.post(f"/api/v1/projects/{self.project.id}/knowledge/sources", {"file": invalid})
+        self.assertEqual(response.status_code, 415)
+        self.assertFalse(KnowledgeSource.objects.exists())
+
+    def test_project_knowledge_retrieval_does_not_cross_project_boundary(self):
+        foreign_project = Project.objects.create(name="Separate project")
+        source = KnowledgeSource.objects.create(
+            project=foreign_project, source_type="pdf", title="other.pdf",
+            checksum_sha256="a" * 64, status="indexed", chunk_count=1,
+        )
+        KnowledgeChunk.objects.create(
+            id="b" * 64, source=source, chunk_index=0, source_type="pdf",
+            content="quasar-only confidential material",
+            content_sha256="c" * 64,
+        )
+        conversation = self.post_json(
+            f"/api/v1/projects/{self.project.id}/knowledge/conversations",
+            {"scope": "project_knowledge", "source_ids": []},
+        )
+        result = self.post_json(
+            f"/api/v1/knowledge/conversations/{conversation.json()['id']}/messages",
+            {"question": "Explain the quasar-only confidential material"},
+        ).json()
+        self.assertEqual(result["evidence_status"], "insufficient_evidence")
+        self.assertEqual(result["citations"], [])
+
+    def test_login_requires_csrf_and_creates_authenticated_session(self):
+        user = User.objects.create_user(username="login-user", password="test-password")
+        client = Client(enforce_csrf_checks=True)
+        client.get("/api/v1/auth/csrf")
+        token = client.cookies["csrftoken"].value
+        rejected = client.post(
+            "/api/v1/auth/login", data=json.dumps({"username": user.username, "password": "test-password"}),
+            content_type="application/json",
+        )
+        self.assertEqual(rejected.status_code, 403)
+        accepted = client.post(
+            "/api/v1/auth/login", data=json.dumps({"username": user.username, "password": "test-password"}),
+            content_type="application/json", HTTP_X_CSRFTOKEN=token,
+        )
+        self.assertEqual(accepted.status_code, 200)
+        self.assertTrue(client.get("/api/v1/auth/me").json()["authenticated"])
+
+    def test_annotation_creation_enforces_role_and_interval(self):
+        invalid = self.post_json(
+            f"/api/v1/videos/{self.video.id}/annotations",
+            {"start_time": -1, "end_time": 1, "action_label": "reach"},
+        )
+        self.assertEqual(invalid.status_code, 422)
+        self.assertEqual(invalid.json()["error"]["code"], "INVALID_INTERVAL")
+        valid = self.post_json(
+            f"/api/v1/videos/{self.video.id}/annotations",
+            {"start_time": 1, "end_time": 2, "action_label": "reach"},
+        )
+        self.assertEqual(valid.status_code, 201)
+        self.assertEqual(AnnotationRevision.objects.filter(annotation_id=valid.json()["id"]).count(), 1)
+
+    def test_role_is_required_for_project_creation(self):
+        response = self.post_json("/api/v1/projects", {"name": "Forbidden"})
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(response.json()["error"]["code"], "PERMISSION_DENIED")
+
+    def test_export_download_is_role_protected(self):
+        response = self.client.get("/api/v1/exports/missing-release/download")
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(response.json()["error"]["code"], "PERMISSION_DENIED")
+
+    def test_rl_experiment_endpoint_enforces_role_and_persists_results(self):
+        denied = self.post_json(
+            f"/api/v1/projects/{self.project.id}/rl-experiments",
+            {"algorithm": "q_learning", "episodes": 100, "seed": 17},
+        )
+        self.assertEqual(denied.status_code, 403)
+
+        engineer = Group.objects.create(name="ML Engineer")
+        self.annotator.groups.add(engineer)
+        response = self.post_json(
+            f"/api/v1/projects/{self.project.id}/rl-experiments",
+            {"algorithm": "q_learning", "episodes": 100, "seed": 17},
+        )
+        self.assertEqual(response.status_code, 201, response.content)
+        self.assertEqual(response.json()["status"], "succeeded")
+        self.assertEqual(response.json()["metrics"]["evaluation"]["baseline_policy"]["success_rate"], 1.0)
+        run = RLExperiment.objects.get(pk=response.json()["id"])
+        self.assertEqual(run.random_seed, 17)
+        expected_policy_digest = hashlib.sha256(
+            json.dumps(json.loads(run.policy_json), sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        self.assertEqual(run.policy_sha256, expected_policy_digest)
+        self.assertIsNotNone(run.started_at)
+        self.assertIsNotNone(run.completed_at)
+        details = self.client.get(f"/api/v1/rl-experiments/{run.id}")
+        self.assertEqual(details.status_code, 200)
+        self.assertEqual(details.json()["id"], run.id)
+        listed = self.client.get(f"/api/v1/projects/{self.project.id}/rl-experiments")
+        self.assertNotIn("policy", listed.json()[0])
+
+    def test_import_is_atomic_when_ontology_label_is_unknown(self):
+        content = (
+            "video_id,start_time,end_time,action_label\n"
+            f"{self.video.id},1,2,reach\n"
+            f"{self.video.id},3,4,not-a-label\n"
+        )
+        upload = SimpleUploadedFile("annotations.csv", content.encode(), content_type="text/csv")
+        response = self.client.post(f"/api/v1/videos/{self.video.id}/annotations/import", {"file": upload})
+        self.assertEqual(response.status_code, 422)
+        self.assertEqual(response.json()["error"]["code"], "IMPORT_VALIDATION_FAILED")
+        self.assertEqual(Annotation.objects.filter(video=self.video).count(), 0)
+
+    def test_review_requires_reason_and_prevents_maker_checker(self):
+        row = Annotation.objects.create(
+            project=self.project, video=self.video, start_time=1, end_time=2,
+            action_label="reach", status="needs_review", created_by=self.annotator.username,
+        )
+        reviewer = User.objects.create_user(username="reviewer", password="test-password")
+        reviewer.groups.add(Group.objects.create(name="Reviewer"))
+        client = Client()
+        client.force_login(reviewer)
+        path = f"/api/v1/annotations/{row.id}/review"
+        missing_reason = client.post(
+            path, data=json.dumps({"decision": "rejected"}), content_type="application/json",
+        )
+        self.assertEqual(missing_reason.status_code, 422)
+        self.assertEqual(missing_reason.json()["error"]["code"], "REVIEW_REASON_REQUIRED")
+
+        self.annotator.groups.add(Group.objects.get(name="Reviewer"))
+        self.client.force_login(self.annotator)
+        own_approval = self.post_json(path, {"decision": "approved"})
+        self.assertEqual(own_approval.status_code, 403)
+        self.assertEqual(own_approval.json()["error"]["code"], "MAKER_CHECKER_REQUIRED")
+
+    def test_submission_requires_reviewer_approval_and_captures_transitions(self):
+        created = self.post_json(
+            f"/api/v1/videos/{self.video.id}/annotations",
+            {"start_time": 1, "end_time": 2, "action_label": "reach"},
+        )
+        self.assertEqual(created.status_code, 201)
+        row = Annotation.objects.get(pk=created.json()["id"])
+        submitted = self.client.post(f"/api/v1/projects/{self.project.id}/submit-review")
+        self.assertEqual(submitted.status_code, 200)
+        row.refresh_from_db()
+        self.assertEqual(row.status, "needs_review")
+        self.assertEqual(row.revision, 2)
+
+        reviewer = User.objects.create_user(username="independent-reviewer", password="test-password")
+        reviewer.groups.add(Group.objects.create(name="Reviewer"))
+        client = Client()
+        client.force_login(reviewer)
+        approved = client.post(
+            f"/api/v1/projects/{self.project.id}/review",
+            data=json.dumps({"decision": "approved"}), content_type="application/json",
+        )
+        self.assertEqual(approved.status_code, 200)
+        row.refresh_from_db()
+        self.assertEqual(row.status, "approved")
+        self.assertEqual(row.revision, 3)
+        self.assertEqual(row.revisions.count(), 3)
+
+    def test_csv_release_is_approved_only_and_download_checksum_is_verified(self):
+        DatasetManager = Group.objects.get_or_create(name="Dataset Manager")[0]
+        self.annotator.groups.add(DatasetManager)
+        Annotation.objects.create(
+            project=self.project, video=self.video, start_time=1, end_time=2,
+            action_label="reach", status="approved", created_by="another-annotator",
+        )
+        Annotation.objects.create(
+            project=self.project, video=self.video, start_time=3, end_time=4,
+            action_label="grasp", status="draft", created_by=self.annotator.username,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            output_dir = Path(directory).resolve()
+            (output_dir / "exports").mkdir()
+            with patch.object(views, "OUTPUT_DIR", output_dir):
+                first = self.post_json(
+                    f"/api/v1/projects/{self.project.id}/exports", {"format": "csv"},
+                )
+                second = self.post_json(
+                    f"/api/v1/projects/{self.project.id}/exports", {"format": "csv"},
+                )
+                self.assertEqual(first.status_code, 201)
+                self.assertEqual(second.status_code, 201)
+                self.assertEqual(first.json()["manifest"]["record_count"], 1)
+                self.assertEqual(first.json()["manifest"]["sha256"], second.json()["manifest"]["sha256"])
+                self.assertEqual(first.json()["release_version"], 1)
+                self.assertEqual(second.json()["release_version"], 2)
+                json_first = self.post_json(
+                    f"/api/v1/projects/{self.project.id}/exports", {"format": "json"},
+                )
+                json_second = self.post_json(
+                    f"/api/v1/projects/{self.project.id}/exports", {"format": "json"},
+                )
+                self.assertEqual(json_first.json()["manifest"]["sha256"], json_second.json()["manifest"]["sha256"])
+                self.assertTrue((output_dir / "exports" / first.json()["storage_key"]).is_file(), first.json())
+
+                download_path = f"/api/v1/exports/{first.json()['id']}/download"
+                resolved_download_path = (views.OUTPUT_DIR / "exports" / first.json()["storage_key"]).resolve()
+                self.assertIn(views.OUTPUT_DIR, resolved_download_path.parents)
+                self.assertTrue(resolved_download_path.is_file())
+                response = self.client.get(download_path)
+                self.assertEqual(response.status_code, 200)
+                self.assertIn(b"reach", b"".join(response.streaming_content))
+
+                export = DatasetExport.objects.get(pk=first.json()["id"])
+                (output_dir / "exports" / export.storage_key).write_bytes(b"tampered")
+                mismatch = self.client.get(download_path)
+                self.assertEqual(mismatch.status_code, 409)
+                self.assertEqual(mismatch.json()["error"]["code"], "EXPORT_CHECKSUM_MISMATCH")

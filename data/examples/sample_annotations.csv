@@ -1,0 +1,9 @@
+video_id,start_time,end_time,action_label,object_label,actor_id,confidence,notes
+demo-video-001,0.0,1.0,approach,water_bottle,human_1,,Synthetic demonstration record
+demo-video-001,1.0,2.1,reach,water_bottle,human_1,,Synthetic demonstration record
+demo-video-001,2.1,2.8,grasp,water_bottle,human_1,,Synthetic demonstration record
+demo-video-001,2.8,3.6,lift,water_bottle,human_1,,Synthetic demonstration record
+demo-video-001,3.6,4.7,move,water_bottle,human_1,,Synthetic demonstration record
+demo-video-001,4.7,5.5,place,water_bottle,human_1,,Synthetic demonstration record
+demo-video-001,5.5,5.9,release,water_bottle,human_1,,Synthetic demonstration record
+demo-video-001,5.9,6.6,withdraw,water_bottle,human_1,,Synthetic demonstration record
