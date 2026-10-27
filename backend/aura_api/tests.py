@@ -11,12 +11,13 @@ from django.test import Client, TestCase
 from pypdf import PdfWriter
 from pypdf.generic import DecodedStreamObject, DictionaryObject, NameObject
 
-from . import views
+from . import knowledge_service, views
 from .models import (
     Annotation, AnnotationRevision, DatasetExport, KnowledgeChunk, KnowledgeConversation,
     KnowledgeSource, Project, RLExperiment, Video,
 )
 from .rl import GridPickPlace, run_experiment
+from aura_rag.evaluation import evaluate_retrieval_fixture, lexical_fixture_retriever
 
 
 class AuraApiTests(TestCase):
@@ -119,6 +120,196 @@ class AuraApiTests(TestCase):
         persisted = self.client.get(f"/api/v1/knowledge/conversations/{conversation.json()['id']}")
         self.assertEqual(len(persisted.json()["messages"]), 2)
 
+    def test_dense_index_persists_model_provenance_and_revalidates_scope(self):
+        source = KnowledgeSource.objects.create(
+            project=self.project,
+            source_type="pdf",
+            title="synthetic-source.pdf",
+            checksum_sha256="a" * 64,
+            status="indexed",
+            index_status="processing",
+        )
+        chunk_values = [{
+            "content": "Before a pick, verify the gripper is open and workspace is clear.",
+            "content_sha256": hashlib.sha256(b"Before a pick, verify the gripper is open and workspace is clear.").hexdigest(),
+            "page_start": 1,
+            "page_end": 1,
+        }]
+
+        class FakeProvider:
+            model_name = "synthetic-test-embedding"
+            model_revision = "fixture-revision-1"
+
+            def embed(self, texts):
+                return [[0.6, 0.8] for _ in texts]
+
+        class FakeStore:
+            def upsert(self, ids, texts, embeddings, metadatas):
+                self.chunk_id = ids[0]
+                self.metadata = metadatas[0]
+                self.embedding = embeddings[0]
+
+            def delete(self, ids):
+                self.deleted_ids = ids
+
+            def query(self, text, embedding, project_id, source_ids, limit):
+                self.query_args = (project_id, source_ids, limit)
+                return [
+                    {"id": self.chunk_id, "distance": 0.1},
+                    {"id": "f" * 64, "distance": 0.0},
+                ]
+
+        store = FakeStore()
+        provider = FakeProvider()
+        available = {
+            "available": True,
+            "model_configured": True,
+            "sentence_transformers_installed": True,
+            "chroma_installed": True,
+        }
+        with patch.object(knowledge_service, "dense_backend_status", return_value=available), patch.object(
+            knowledge_service, "_local_vector_components", return_value=(provider, store),
+        ):
+            rows, warning = knowledge_service._persist_chunks(source, chunk_values)
+
+            source.refresh_from_db()
+            chunk = source.chunks.get()
+            self.assertIsNone(warning)
+            self.assertEqual(source.index_status, "ready")
+            self.assertEqual(source.dense_index_status, "ready")
+            self.assertEqual(source.index_backend, "chroma_sentence_transformers")
+            self.assertEqual(source.embedding_model_revision, "fixture-revision-1")
+            self.assertEqual(source.embedding_dimensions, 2)
+            self.assertEqual(chunk.source_checksum_sha256, source.checksum_sha256)
+            self.assertEqual(chunk.index_version, source.index_version)
+            self.assertEqual(chunk.embedding_model_revision, "fixture-revision-1")
+            self.assertEqual(store.metadata["project_id"], self.project.id)
+            self.assertEqual(store.metadata["source_id"], source.id)
+            self.assertEqual(store.metadata["source_checksum_sha256"], source.checksum_sha256)
+            self.assertEqual(store.metadata["chunk_checksum_sha256"], chunk.content_sha256)
+            self.assertEqual(store.metadata["index_version"], source.index_version)
+
+            conversation = self.post_json(
+                f"/api/v1/projects/{self.project.id}/knowledge/conversations",
+                {"scope": "documents_only", "source_ids": [source.id]},
+            )
+            response = self.post_json(
+                f"/api/v1/knowledge/conversations/{conversation.json()['id']}/messages",
+                {"question": "Which manipulator condition precedes a grasp?"},
+            )
+            self.assertEqual(response.status_code, 201, response.content)
+            self.assertEqual(response.json()["retrieval"]["method"], "dense_local")
+            self.assertEqual([item["source_id"] for item in response.json()["citations"]], [source.id])
+            self.assertEqual(store.query_args, (self.project.id, [source.id], 12))
+
+            provider.model_revision = "fixture-revision-2"
+            fallback_response = self.post_json(
+                f"/api/v1/knowledge/conversations/{conversation.json()['id']}/messages",
+                {"question": "Which manipulator condition precedes a grasp?"},
+            )
+            self.assertEqual(fallback_response.status_code, 201)
+            self.assertEqual(fallback_response.json()["retrieval"]["method"], "lexical_sqlite")
+            self.assertTrue(any("current model/index" in warning for warning in fallback_response.json()["warnings"]))
+            source.refresh_from_db()
+            self.assertEqual(source.dense_index_status, "stale")
+
+    def test_dense_index_failure_keeps_lexical_index_available(self):
+        source = KnowledgeSource.objects.create(
+            project=self.project,
+            source_type="pdf",
+            title="synthetic-fallback.pdf",
+            checksum_sha256="b" * 64,
+            status="processing",
+            index_status="processing",
+        )
+
+        class InvalidProvider:
+            model_name = "synthetic-invalid"
+            model_revision = "bad-fixture"
+
+            def embed(self, texts):
+                return [[1.0], [1.0, 2.0]]
+
+        class UnusedStore:
+            def upsert(self, *args):
+                raise AssertionError("Invalid vectors must not be written to Chroma.")
+
+            def delete(self, ids):
+                self.deleted_ids = ids
+
+        with patch.object(knowledge_service, "dense_backend_status", return_value={
+            "available": True,
+            "model_configured": True,
+            "sentence_transformers_installed": True,
+            "chroma_installed": True,
+        }), patch.object(
+            knowledge_service, "_local_vector_components", return_value=(InvalidProvider(), UnusedStore()),
+        ):
+            _, warning = knowledge_service._persist_chunks(source, [
+                {"content": "A synthetic fallback source has clear evidence.", "content_sha256": "c" * 64},
+                {"content": "Another valid text chunk.", "content_sha256": "d" * 64},
+            ])
+        source.refresh_from_db()
+        self.assertEqual(source.status, "processing")
+        self.assertEqual(source.index_status, "ready")
+        self.assertEqual(source.dense_index_status, "failed")
+        self.assertEqual(source.index_backend, "lexical_sqlite")
+        self.assertIsNone(source.embedding_dimensions)
+        self.assertIn("lexical indexing remains available", warning)
+
+    def test_dense_index_without_runtime_components_is_not_marked_ready(self):
+        source = KnowledgeSource.objects.create(
+            project=self.project,
+            source_type="pdf",
+            title="synthetic-unavailable-dense.pdf",
+            checksum_sha256="e" * 64,
+            status="processing",
+            index_status="processing",
+        )
+        with patch.object(knowledge_service, "dense_backend_status", return_value={
+            "available": True,
+            "model_configured": True,
+            "sentence_transformers_installed": True,
+            "chroma_installed": True,
+        }), patch.object(knowledge_service, "_local_vector_components", return_value=(None, None)):
+            _, warning = knowledge_service._persist_chunks(source, [{
+                "content": "Synthetic text remains searchable in lexical mode.",
+                "content_sha256": "f" * 64,
+            }])
+        source.refresh_from_db()
+        self.assertEqual(source.index_status, "ready")
+        self.assertEqual(source.dense_index_status, "failed")
+        self.assertEqual(source.index_backend, "lexical_sqlite")
+        self.assertIn("lexical indexing remains available", warning)
+
+    def test_dense_vector_deletion_supports_legacy_model_collection(self):
+        class FakeStore:
+            deleted_ids = None
+
+            def delete(self, ids):
+                self.deleted_ids = ids
+
+        store = FakeStore()
+        with patch.object(knowledge_service, "configured_vector_store", return_value=store) as factory:
+            knowledge_service._delete_vector_records([{
+                "id": "legacy-chunk",
+                "embedding_model": "legacy-model",
+                "embedding_model_revision": "",
+            }])
+        factory.assert_called_once_with(
+            knowledge_service.VECTOR_STORE_DIR, "legacy-model", "",
+        )
+        self.assertEqual(store.deleted_ids, ["legacy-chunk"])
+
+    def test_synthetic_retrieval_evaluation_fixture_reports_computed_metrics(self):
+        fixture_path = Path(__file__).resolve().parents[2] / "data" / "examples" / "rag_retrieval_evaluation.json"
+        fixture = json.loads(fixture_path.read_text(encoding="utf-8"))
+        metrics = evaluate_retrieval_fixture(fixture, lexical_fixture_retriever, top_k=2)
+        self.assertEqual(metrics["positive_question_count"], 3)
+        self.assertEqual(metrics["negative_question_count"], 1)
+        self.assertEqual(metrics["recall_at_k"], 1.0)
+        self.assertEqual(metrics["negative_abstention_rate"], 1.0)
+
     def test_pdf_upload_citation_scope_abstention_duplicate_and_deletion(self):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
@@ -134,6 +325,8 @@ class AuraApiTests(TestCase):
             self.assertEqual(source.page_count, 1)
             self.assertEqual(source.index_backend, "lexical_sqlite")
             self.assertIsNone(source.embedding_dimensions)
+            self.assertEqual(source.index_status, "ready")
+            self.assertEqual(source.dense_index_status, "not_configured")
             self.assertEqual(source.checksum_sha256, hashlib.sha256(content).hexdigest())
             chunk = source.chunks.get()
             self.assertEqual((chunk.page_start, chunk.page_end), (1, 1))
@@ -244,6 +437,8 @@ class AuraApiTests(TestCase):
             )
             corrupt_source = KnowledgeSource.objects.get(pk=corrupt_response.json()["id"])
             self.assertEqual(corrupt_source.status, "failed")
+            self.assertEqual(corrupt_source.index_status, "failed")
+            self.assertEqual(corrupt_source.dense_index_status, "failed")
             self.assertIn("could not be read", corrupt_source.error_summary)
 
     def test_invalid_pdf_signature_is_rejected_before_storage(self):
@@ -290,6 +485,93 @@ class AuraApiTests(TestCase):
         )
         self.assertEqual(accepted.status_code, 200)
         self.assertTrue(client.get("/api/v1/auth/me").json()["authenticated"])
+
+    def test_invalid_login_does_not_create_an_authenticated_session(self):
+        user = User.objects.create_user(username="invalid-login-user", password="test-password")
+        client = Client(enforce_csrf_checks=True)
+        client.get("/api/v1/auth/csrf")
+        token = client.cookies["csrftoken"].value
+        response = client.post(
+            "/api/v1/auth/login",
+            data=json.dumps({"username": user.username, "password": "incorrect-password"}),
+            content_type="application/json",
+            HTTP_X_CSRFTOKEN=token,
+        )
+        self.assertEqual(response.status_code, 401)
+        self.assertEqual(response.json()["error"]["code"], "INVALID_CREDENTIALS")
+        self.assertEqual(client.get("/api/v1/auth/me").status_code, 401)
+        self.assertEqual(client.get("/api/v1/projects").status_code, 401)
+
+    def test_logout_invalidates_the_frontend_session(self):
+        user = User.objects.create_user(username="logout-user", password="test-password")
+        client = Client(enforce_csrf_checks=True)
+        client.get("/api/v1/auth/csrf")
+        token = client.cookies["csrftoken"].value
+        login_response = client.post(
+            "/api/v1/auth/login",
+            data=json.dumps({"username": user.username, "password": "test-password"}),
+            content_type="application/json",
+            HTTP_X_CSRFTOKEN=token,
+        )
+        self.assertEqual(login_response.status_code, 200)
+        session_cookie = login_response.cookies["sessionid"]
+        self.assertTrue(session_cookie["httponly"])
+        self.assertEqual(session_cookie["samesite"], "Lax")
+        self.assertEqual(client.get("/api/v1/auth/me").status_code, 200)
+        self.assertEqual(client.get("/api/v1/projects").status_code, 200)
+
+        logout_response = client.post(
+            "/api/v1/auth/logout",
+            data="{}",
+            content_type="application/json",
+            HTTP_X_CSRFTOKEN=client.cookies["csrftoken"].value,
+        )
+        self.assertEqual(logout_response.status_code, 200)
+        self.assertFalse(logout_response.json()["authenticated"])
+        self.assertEqual(client.get("/api/v1/auth/me").status_code, 401)
+        self.assertEqual(client.get("/api/v1/projects").status_code, 401)
+
+    def test_admin_login_uses_the_same_django_session_as_the_api(self):
+        user = User(
+            username="admin-session-user",
+            is_staff=True,
+            is_superuser=True,
+            is_active=True,
+        )
+        user.set_password("test-password")
+        user.save()
+        client = Client(enforce_csrf_checks=True)
+        self.assertEqual(client.get("/admin/").status_code, 302)
+        self.assertEqual(client.get("/admin/login/").status_code, 200)
+
+        admin_login = client.post(
+            "/admin/login/",
+            {
+                "username": user.username,
+                "password": "test-password",
+                "next": "/admin/",
+                "csrfmiddlewaretoken": client.cookies["csrftoken"].value,
+            },
+        )
+        self.assertEqual(admin_login.status_code, 302)
+        api_identity = client.get("/api/v1/auth/me")
+        self.assertEqual(api_identity.status_code, 200)
+        self.assertEqual(api_identity.json()["user"]["username"], user.username)
+        self.assertIn("Administrator", api_identity.json()["user"]["roles"])
+        self.assertEqual(client.get("/admin/").status_code, 200)
+
+    def test_frontend_origin_cors_preflight_allows_credentials_and_csrf_header(self):
+        client = Client()
+        response = client.options(
+            "/api/v1/projects",
+            HTTP_ORIGIN="http://localhost:5173",
+            HTTP_ACCESS_CONTROL_REQUEST_METHOD="POST",
+            HTTP_ACCESS_CONTROL_REQUEST_HEADERS="content-type,x-csrftoken",
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response["Access-Control-Allow-Origin"], "http://localhost:5173")
+        self.assertEqual(response["Access-Control-Allow-Credentials"], "true")
+        self.assertIn("x-csrftoken", response["Access-Control-Allow-Headers"])
 
     def test_annotation_creation_enforces_role_and_interval(self):
         invalid = self.post_json(

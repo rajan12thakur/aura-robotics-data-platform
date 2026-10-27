@@ -1,0 +1,35 @@
+{
+  "fixture_label": "synthetic retrieval evaluation; not production-quality benchmark data",
+  "documents": [
+    {
+      "id": "synthetic-guideline-gripper",
+      "text": "Before a pick, verify the gripper is open and the workspace is clear."
+    },
+    {
+      "id": "synthetic-annotation-lift",
+      "text": "The stored synthetic video annotations record grasp from 2.1 to 2.8 seconds and lift from 2.8 to 3.6 seconds."
+    },
+    {
+      "id": "synthetic-data-handling",
+      "text": "Uploaded PDF files are stored under generated private names and checked using a content checksum."
+    }
+  ],
+  "questions": [
+    {
+      "question": "What should be checked before a pick?",
+      "expected_document_id": "synthetic-guideline-gripper"
+    },
+    {
+      "question": "When does the stored lift annotation occur?",
+      "expected_document_id": "synthetic-annotation-lift"
+    },
+    {
+      "question": "How are uploaded PDF files named and checked?",
+      "expected_document_id": "synthetic-data-handling"
+    },
+    {
+      "question": "What is the capital of Mars?",
+      "expected_document_id": null
+    }
+  ]
+}

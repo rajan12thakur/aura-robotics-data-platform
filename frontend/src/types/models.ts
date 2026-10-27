@@ -104,6 +104,10 @@ export interface KnowledgeSource {
   index_backend: string;
   embedding_model: string;
   embedding_dimensions: number | null;
+  embedding_model_revision: string;
+  index_status: "pending" | "processing" | "ready" | "failed" | "stale";
+  dense_index_status: "not_configured" | "pending" | "processing" | "ready" | "failed" | "stale";
+  index_version: number;
   status: "queued" | "processing" | "indexed" | "partially_indexed" | "failed" | "deleted";
   warnings: string[];
   error_summary: string;
@@ -141,6 +145,7 @@ export interface KnowledgeMessage {
       candidate_count: number;
       used_lexical_fallback: boolean;
       embedding_model: string | null;
+      embedding_model_revision?: string | null;
     };
   };
   citations: KnowledgeCitation[];
@@ -170,6 +175,7 @@ export interface KnowledgeAnswer {
     candidate_count: number;
     used_lexical_fallback: boolean;
     embedding_model: string | null;
+    embedding_model_revision?: string | null;
   };
   warnings: string[];
   messages: KnowledgeMessage[];

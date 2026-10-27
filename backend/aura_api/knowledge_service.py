@@ -1,6 +1,8 @@
 import hashlib
 import importlib.util
 import json
+import logging
+import math
 import os
 import re
 from collections import defaultdict
@@ -10,10 +12,17 @@ from django.db.models import Q
 from django.utils import timezone
 
 from aura_rag.core import PdfIngestionError, chunk_pages, lexical_score, parse_pdf, sha256_bytes
-from aura_rag.vector import configured_embedding_provider, configured_vector_store
+from aura_rag.vector import (
+    configured_embedding_provider,
+    configured_model_identity,
+    configured_vector_store,
+    dense_backend_status,
+)
 
 from . import models
 from .config import MEDIA_DIR, VECTOR_STORE_DIR
+
+logger = logging.getLogger("aura.knowledge")
 
 
 def _json_dump(value):
@@ -35,6 +44,10 @@ def serialize_source(source):
         "index_backend": source.index_backend,
         "embedding_model": source.embedding_model,
         "embedding_dimensions": source.embedding_dimensions,
+        "embedding_model_revision": source.embedding_model_revision,
+        "index_status": source.index_status,
+        "dense_index_status": source.dense_index_status,
+        "index_version": source.index_version,
         "status": source.status,
         "warnings": json.loads(source.warnings_json),
         "error_summary": source.error_summary,
@@ -58,7 +71,9 @@ def _local_vector_components():
         return None, None
     if provider is None:
         return None, None
-    store = configured_vector_store(VECTOR_STORE_DIR, provider.model_name)
+    store = configured_vector_store(
+        VECTOR_STORE_DIR, provider.model_name, provider.model_revision,
+    )
     if store is None:
         return None, None
     return provider, store
@@ -70,18 +85,24 @@ def _delete_vector_records(chunk_rows):
     grouped_ids = defaultdict(list)
     for row in chunk_rows:
         if row["embedding_model"]:
-            grouped_ids[row["embedding_model"]].append(row["id"])
-    for model_name, chunk_ids in grouped_ids.items():
+            grouped_ids[(row["embedding_model"], row["embedding_model_revision"])].append(row["id"])
+    for (model_name, revision), chunk_ids in grouped_ids.items():
         try:
-            store = configured_vector_store(VECTOR_STORE_DIR, model_name)
+            store = configured_vector_store(VECTOR_STORE_DIR, model_name, revision)
         except ImportError:
             store = None
         if store is not None:
-            store.delete(chunk_ids)
+            try:
+                store.delete(chunk_ids)
+            except Exception as exc:
+                logger.warning(
+                    "Dense knowledge vector deletion failed model=%s error_type=%s",
+                    model_name, type(exc).__name__,
+                )
 
 
 def _persist_chunks(source, chunk_values):
-    old_rows = list(source.chunks.values("id", "embedding_model"))
+    old_rows = list(source.chunks.values("id", "embedding_model", "embedding_model_revision"))
     _delete_vector_records(old_rows)
     source.chunks.all().delete()
 
@@ -103,53 +124,115 @@ def _persist_chunks(source, chunk_values):
             video_start_seconds=value.get("video_start_seconds"),
             video_end_seconds=value.get("video_end_seconds"),
             annotation_id=value.get("annotation_id", ""),
+            source_checksum_sha256=source.checksum_sha256,
+            index_version=source.index_version,
             metadata_json=_json_dump(value.get("metadata", {})),
         ))
     models.KnowledgeChunk.objects.bulk_create(rows)
 
     backend = "lexical_sqlite"
     model_name = ""
+    model_revision = ""
     embedding_dimensions = None
-    provider, store = _local_vector_components()
-    if rows and provider is not None and store is not None:
-        vectors = provider.embed([row.content for row in rows])
-        embedding_dimensions = len(vectors[0]) if vectors else None
-        metadatas = [{
-            "project_id": source.project_id,
-            "source_id": source.id,
-            "source_type": source.source_type,
-            "video_id": source.video_id or "",
-            "page_start": row.page_start or 0,
-            "chunk_index": row.chunk_index,
-        } for row in rows]
-        store.upsert([row.id for row in rows], [row.content for row in rows], vectors, metadatas)
-        backend = "chroma_sentence_transformers"
-        model_name = provider.model_name
-        models.KnowledgeChunk.objects.filter(source=source).update(
-            index_backend=backend, embedding_model=model_name,
-            embedding_dimensions=embedding_dimensions,
+    dense_capability = dense_backend_status()
+    dense_status = "processing" if dense_capability["available"] and rows else "not_configured"
+    dense_warning = None
+    if dense_capability["model_configured"] and not dense_capability["available"]:
+        dense_status = "failed"
+        dense_warning = "Local dense dependencies are incomplete; searchable lexical indexing remains available."
+    try:
+        provider, store = _local_vector_components() if dense_capability["available"] else (None, None)
+        if rows and dense_capability["available"]:
+            if provider is None or store is None:
+                raise RuntimeError("Configured local embedding dependencies are unavailable.")
+            vectors = provider.embed([row.content for row in rows])
+            if len(vectors) != len(rows) or not vectors:
+                raise ValueError("Embedding provider returned an invalid vector count.")
+            embedding_dimensions = len(vectors[0])
+            if not embedding_dimensions or any(
+                len(vector) != embedding_dimensions
+                or not all(math.isfinite(float(value)) for value in vector)
+                for vector in vectors
+            ):
+                raise ValueError("Embedding provider returned invalid vector dimensions or values.")
+            model_name = provider.model_name
+            model_revision = provider.model_revision
+            metadatas = [{
+                "project_id": source.project_id,
+                "source_id": source.id,
+                "source_type": source.source_type,
+                "video_id": source.video_id or "",
+                "source_checksum_sha256": source.checksum_sha256,
+                "chunk_checksum_sha256": row.content_sha256,
+                "index_version": source.index_version,
+                "embedding_model": model_name,
+                "embedding_model_revision": model_revision,
+                "page_start": row.page_start or 0,
+                "chunk_index": row.chunk_index,
+            } for row in rows]
+            try:
+                store.upsert([row.id for row in rows], [row.content for row in rows], vectors, metadatas)
+            except Exception:
+                store.delete([row.id for row in rows])
+                raise
+            backend = "chroma_sentence_transformers"
+            dense_status = "ready"
+            models.KnowledgeChunk.objects.filter(source=source).update(
+                index_backend=backend,
+                embedding_model=model_name,
+                embedding_dimensions=embedding_dimensions,
+                embedding_model_revision=model_revision,
+            )
+    except Exception as exc:
+        dense_status = "failed"
+        model_name = ""
+        model_revision = ""
+        embedding_dimensions = None
+        dense_warning = (
+            "Local dense indexing failed; searchable lexical indexing remains available. "
+            f"Failure type: {type(exc).__name__}."
         )
+        logger.warning("Dense knowledge indexing failed source_id=%s error_type=%s", source.id, type(exc).__name__)
     source.chunk_count = len(rows)
     source.index_backend = backend
     source.embedding_model = model_name
     source.embedding_dimensions = embedding_dimensions
+    source.embedding_model_revision = model_revision
+    source.index_status = "ready"
+    source.dense_index_status = dense_status
+    if dense_warning:
+        warnings = json.loads(source.warnings_json)
+        warnings.append(dense_warning)
+        source.warnings_json = _json_dump(warnings)
     source.processed_at = timezone.now()
     source.save(update_fields=[
-        "chunk_count", "index_backend", "embedding_model", "embedding_dimensions", "processed_at",
+        "chunk_count", "index_backend", "embedding_model", "embedding_dimensions",
+        "embedding_model_revision", "index_status", "dense_index_status",
+        "warnings_json", "processed_at",
     ])
-    return rows
+    return rows, dense_warning
 
 
 def ingest_pdf(source, content, retry_count=0):
     if retry_count and source.chunks.exists():
         source.source_version += 1
-        source.save(update_fields=["source_version"])
+        source.index_version += 1
+        source.save(update_fields=["source_version", "index_version"])
     job = models.KnowledgeJob.objects.create(
         source=source, job_type="pdf_index", status="processing", retry_count=retry_count,
     )
     source.status = "processing"
+    source.index_status = "processing"
+    dense_capability = dense_backend_status()
+    source.dense_index_status = (
+        "processing" if dense_capability["available"]
+        else "failed" if dense_capability["model_configured"]
+        else "not_configured"
+    )
     source.error_summary = ""
-    source.save(update_fields=["status", "error_summary"])
+    source.save(update_fields=[
+        "status", "index_status", "dense_index_status", "error_summary",
+    ])
     try:
         pages, empty_pages = parse_pdf(content)
         chunks = chunk_pages(pages)
@@ -160,7 +243,7 @@ def ingest_pdf(source, content, retry_count=0):
             "page_end": chunk.page_end,
             "metadata": {"chunker_version": "page-char-overlap-v1"},
         } for chunk in chunks]
-        _persist_chunks(source, chunk_values)
+        _, dense_warning = _persist_chunks(source, chunk_values)
         warnings = []
         if empty_pages:
             warnings.append(
@@ -168,6 +251,8 @@ def ingest_pdf(source, content, retry_count=0):
             )
         if not chunks:
             warnings.append("No selectable text was found; provide a text-based PDF or configure a local OCR adapter.")
+        if dense_warning:
+            warnings.append(dense_warning)
         source.page_count = len(pages) + len(empty_pages)
         source.status = "partially_indexed" if empty_pages or not chunks else "indexed"
         source.warnings_json = _json_dump(warnings)
@@ -178,14 +263,22 @@ def ingest_pdf(source, content, retry_count=0):
         job.warning_count = len(warnings)
     except PdfIngestionError as exc:
         source.status = "failed"
+        source.index_status = "failed"
+        source.dense_index_status = "failed"
         source.error_summary = str(exc)[:500]
-        source.save(update_fields=["status", "error_summary"])
+        source.save(update_fields=[
+            "status", "index_status", "dense_index_status", "error_summary",
+        ])
         job.status = "failed"
         job.error_summary = source.error_summary
     except Exception:
         source.status = "failed"
+        source.index_status = "failed"
+        source.dense_index_status = "failed"
         source.error_summary = "PDF indexing failed; check local parser, embedding, and vector-store configuration."
-        source.save(update_fields=["status", "error_summary"])
+        source.save(update_fields=[
+            "status", "index_status", "dense_index_status", "error_summary",
+        ])
         job.status = "failed"
         job.error_summary = source.error_summary
         raise
@@ -261,7 +354,18 @@ def index_video(video):
         project=video.project, video=video, source_type="video", deleted_at__isnull=True,
     ).first()
     if source and source.checksum_sha256 == digest and source.chunks.exists():
-        return source
+        dense_capability = dense_backend_status()
+        configured_identity = configured_model_identity() if dense_capability["available"] else None
+        index_is_current = (
+            source.dense_index_status == "ready"
+            and configured_identity == (
+                source.embedding_model, source.embedding_model_revision,
+            )
+        )
+        if not dense_capability["available"] or index_is_current:
+            return source
+        source.index_version += 1
+        source.save(update_fields=["index_version"])
     if source is None:
         source = models.KnowledgeSource.objects.create(
             project=video.project,
@@ -272,8 +376,16 @@ def index_video(video):
         )
     elif source.checksum_sha256 != digest:
         source.source_version += 1
+        source.index_version += 1
     source.checksum_sha256 = digest
     source.status = "processing"
+    source.index_status = "processing"
+    dense_capability = dense_backend_status()
+    source.dense_index_status = (
+        "processing" if dense_capability["available"]
+        else "failed" if dense_capability["model_configured"]
+        else "not_configured"
+    )
     pixels_available = False
     if video.storage_key:
         candidate = (MEDIA_DIR / video.storage_key).resolve()
@@ -291,13 +403,17 @@ def index_video(video):
     try:
         _persist_chunks(source, evidence)
         source.status = "indexed"
-        source.save(update_fields=["status"])
+        source.save(update_fields=["status", "index_status"])
         job.status = "succeeded"
         job.chunk_count = len(evidence)
     except Exception:
         source.status = "failed"
+        source.index_status = "failed"
+        source.dense_index_status = "failed"
         source.error_summary = "Video metadata and annotation indexing failed."
-        source.save(update_fields=["status", "error_summary"])
+        source.save(update_fields=[
+            "status", "index_status", "dense_index_status", "error_summary",
+        ])
         job.status = "failed"
         job.error_summary = source.error_summary
         raise
@@ -347,9 +463,13 @@ def answer_question(conversation, question):
         source_id__in=allowed_ids,
         source__project=conversation.project,
         source__deleted_at__isnull=True,
+        index_version=models.F("source__index_version"),
+        source_checksum_sha256=models.F("source__checksum_sha256"),
     ).select_related("source").order_by("chunk_index"))
     retrieval_method = "lexical_sqlite"
     model_name = ""
+    model_revision = ""
+    retrieval_warnings = []
     candidates = []
 
     video_sources = {source.id: source for source in allowed_sources if source.source_type == "video"}
@@ -363,25 +483,70 @@ def answer_question(conversation, question):
         retrieval_method = "structured_video_annotations"
     else:
         dense_sources = [source for source in allowed_sources if source.index_backend == "chroma_sentence_transformers"]
-        if dense_sources and len(dense_sources) == len(allowed_sources):
-            provider, store = _local_vector_components()
-            if provider is not None and store is not None:
+        dense_ready = (
+            dense_sources
+            and len(dense_sources) == len(allowed_sources)
+            and all(
+                source.dense_index_status == "ready"
+                and source.index_status == "ready"
+                and source.embedding_model
+                and source.embedding_model_revision
+                and source.embedding_dimensions
+                for source in dense_sources
+            )
+            and len({(source.embedding_model, source.embedding_model_revision, source.embedding_dimensions)
+                     for source in dense_sources}) == 1
+        )
+        if dense_sources and not dense_ready:
+            retrieval_warnings.append(
+                "Dense indexes are stale, unavailable, or incompatible; lexical retrieval was used."
+            )
+        if dense_ready:
+            try:
+                provider, store = _local_vector_components()
+                if provider is None or store is None:
+                    raise RuntimeError("Configured local embedding dependencies are unavailable.")
+                expected_model = dense_sources[0].embedding_model
+                expected_revision = dense_sources[0].embedding_model_revision
+                if provider.model_name != expected_model or provider.model_revision != expected_revision:
+                    models.KnowledgeSource.objects.filter(
+                        id__in=[source.id for source in dense_sources]
+                    ).update(dense_index_status="stale")
+                    raise RuntimeError("The configured local embedding model differs from the indexed model.")
                 query_vector = provider.embed([question])[0]
+                if len(query_vector) != dense_sources[0].embedding_dimensions:
+                    raise RuntimeError("The query embedding dimensions differ from the persisted index.")
                 dense_results = store.query(
                     question, query_vector, conversation.project_id, allowed_ids, 12,
                 )
                 allowed_chunk_map = {chunk.id: chunk for chunk in chunks}
                 candidates = [
-                    (max(0.0, 1.0 - result["distance"]), allowed_chunk_map[result["id"]])
+                    (1.0 - float(result["distance"]), allowed_chunk_map[result["id"]])
                     for result in dense_results
                     if result["id"] in allowed_chunk_map
+                    and math.isfinite(float(result["distance"]))
+                    and 1.0 - float(result["distance"]) >= 0.2
                 ]
-                retrieval_method = "dense_vector"
+                retrieval_method = "dense_local"
                 model_name = provider.model_name
+                model_revision = provider.model_revision
+            except Exception as exc:
+                logger.warning(
+                    "Dense knowledge retrieval unavailable project_id=%s error_type=%s",
+                    conversation.project_id, type(exc).__name__,
+                )
+                retrieval_warnings.append(
+                    "Dense retrieval is unavailable for the current model/index; lexical retrieval was used."
+                )
         if not candidates and retrieval_method != "structured_video_annotations":
+            if retrieval_method == "dense_local":
+                retrieval_warnings.append(
+                    "No dense result met the evidence threshold; lexical fallback was used."
+                )
             candidates = _lexical_candidates(question, chunks, 12)
             retrieval_method = "lexical_sqlite"
             model_name = ""
+            model_revision = ""
 
     citations = []
     for score, chunk in candidates:
@@ -440,12 +605,13 @@ def answer_question(conversation, question):
             "candidate_count": len(candidates),
             "used_lexical_fallback": retrieval_method == "lexical_sqlite",
             "embedding_model": model_name or None,
+            "embedding_model_revision": model_revision or None,
         },
         "warnings": [
             warning
             for source in allowed_sources
             for warning in json.loads(source.warnings_json)
-        ],
+        ] + retrieval_warnings,
     }
 
 
@@ -537,7 +703,7 @@ def serialize_conversation(conversation, include_messages=False):
 
 
 def delete_source(source):
-    chunk_rows = list(source.chunks.values("id", "embedding_model"))
+    chunk_rows = list(source.chunks.values("id", "embedding_model", "embedding_model_revision"))
     _delete_vector_records(chunk_rows)
     source.chunks.all().delete()
     if source.storage_key:
@@ -547,6 +713,11 @@ def delete_source(source):
             target.unlink()
     source.storage_key = ""
     source.status = "deleted"
+    source.index_status = "stale"
+    source.dense_index_status = "stale" if source.embedding_model else "not_configured"
     source.deleted_at = timezone.now()
     source.chunk_count = 0
-    source.save(update_fields=["storage_key", "status", "deleted_at", "chunk_count"])
+    source.save(update_fields=[
+        "storage_key", "status", "index_status", "dense_index_status",
+        "deleted_at", "chunk_count",
+    ])

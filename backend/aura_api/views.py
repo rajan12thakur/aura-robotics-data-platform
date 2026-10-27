@@ -32,8 +32,8 @@ from .exceptions import ApiError
 from .rl import ACTION_NAMES, ENVIRONMENT_VERSION, GOAL_CELL, GRID_WIDTH, MAX_EPISODES, MAX_STEPS, OBJECT_CELL, START_CELL
 from .rl_service import execute_experiment
 from . import knowledge_service
+from aura_rag.vector import dense_backend_status
 from .config import RAG_MAX_PDF_MB
-from .config import VECTOR_STORE_DIR
 
 logger = logging.getLogger("aura.api")
 POLICY_PATH = Path(__file__).resolve().parents[2] / "docs" / "annotation_policy_v1.md"
@@ -383,22 +383,23 @@ def _user_summary(user):
 @api
 @require_http_methods(["GET"])
 def capabilities(request):
-    embedding_path = os.getenv("AURA_EMBEDDING_MODEL_PATH", "").strip()
-    embedding_configured = bool(
-        embedding_path and Path(embedding_path).is_dir()
-        and importlib.util.find_spec("sentence_transformers")
-    )
-    chroma_installed = importlib.util.find_spec("chromadb") is not None
+    dense_status = dense_backend_status()
+    embedding_configured = bool(dense_status["model_configured"])
     return JsonResponse({
         "database": "sqlite", "assistant": {"mode": "deterministic", "llm_provider_adapter": False},
         "vision": {"enabled": VISION_ENABLED, "detector_configured": bool(VISION_ENABLED and VISION_WEIGHTS_PATH and Path(VISION_WEIGHTS_PATH).is_file()), "detector_ready": False, "metadata_extraction": _opencv_available()},
         "rag": {
             "answer_mode": "deterministic_extractive",
-            "retrieval_mode": "dense_vector" if embedding_configured and chroma_installed else "lexical_sqlite",
+            "default_retrieval_mode": "lexical_sqlite",
+            "available_retrieval_modes": (
+                ["lexical_sqlite", "dense_local"]
+                if dense_status["available"] else ["lexical_sqlite"]
+            ),
+            "dense_local_available": dense_status["available"],
             "embedding_model": os.getenv("AURA_EMBEDDING_MODEL", "") if embedding_configured else None,
             "embedding_model_configured": embedding_configured,
-            "chroma_installed": chroma_installed,
-            "vector_store_path": str(VECTOR_STORE_DIR) if chroma_installed else None,
+            "chroma_installed": dense_status["chroma_installed"],
+            "sentence_transformers_installed": dense_status["sentence_transformers_installed"],
             "pdf_parser_installed": importlib.util.find_spec("pypdf") is not None,
             "ocr_configured": False,
             "external_llm_configured": False,

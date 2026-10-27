@@ -108,6 +108,17 @@ ORM schema migrations are run with `python manage.py migrate`. An interactive
 OpenAPI/Swagger page is not included in this Django build. The frontend Vite
 server proxies `/api` to the local API.
 
+The AURA workspace has its own username/password form and validates the
+current Django session through `/api/v1/auth/me`; `/admin/` remains a separate
+Django administrative interface. Both use Django's session authentication,
+so an admin login can also authenticate the workspace when both are opened
+with the same hostname (for example, `127.0.0.1`). A different hostname such
+as `localhost` has a separate browser cookie jar. The UI sends the session
+cookie and CSRF header through the Vite `/api` proxy. The session cookie is
+HttpOnly and SameSite=Lax; Secure is enabled in production mode. These local
+settings and role groups are not a substitute for production identity,
+project-membership ACLs, rate limiting, or deployment security review.
+
 If startup fails with `ModuleNotFoundError: No module named 'aura_rag'`,
 reinstall the editable project into the same active virtual environment used
 to launch Django, from the repository root:

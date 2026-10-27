@@ -8,8 +8,8 @@ and commands; optional dependencies and unrun capabilities are labelled.
 
 | Audit item | Observed evidence |
 |---|---|
-| Branch and recent history | Branch `feature/1-initialize-aura-platform`; latest commit at audit was `f657e7f` (`Merge remote-tracking branch 'origin/main'`). No commit/push was made for this continuation. |
-| Worktree | Already contained a modified `.gitignore`, modified `README.md`, and untracked application/docs/data files before this slice. Existing work was retained. |
+| Branch and recent history | Branch `feature/1-initialize-aura-platform`; latest commit at this audit was `98724f9` (`phase 1 done`). No commit/push was made for this phase. |
+| Worktree | Initially contained only untracked `frontend/.vite/`; it was preserved. This phase modified `README.md`, `backend/aura_api/tests.py`, and the two implementation reports. |
 | Runtime | Python 3.11.0, Django 5.2.18, Node 22.20.0, npm 10.9.3. |
 | Framework/package baseline | Django ORM, SQLite default, React 18, TypeScript, Vite. Base project dependencies were Django and django-cors-headers; `pypdf` was added for this slice. |
 | Database migrations | Applied `0001` through `0005` before this slice; forward migrations `0006_knowledgechunk_knowledgeconversation_and_more` and `0007_knowledgechunk_embedding_dimensions_and_more` are now applied. |
@@ -21,6 +21,20 @@ and commands; optional dependencies and unrun capabilities are labelled.
 | Existing pages | Overview, Projects, Annotation Workspace, Dataset Quality, AI Assistant, Simulation, Policy & Guidelines, Audit Trail, Settings. Added Video & Document Chat. |
 | Existing media/sample data | `data/examples/sample_annotations.csv`; `data/media/` is the private managed-media root; synthetic demo video has no available pixels. Added a clearly synthetic PDF guideline fixture. |
 | Preserved paths | `.dist/`, `LICENSE`, `AURA_MASTER_IMPLEMENTATION_PROMPT.md`, existing demo records, environment templates, and unrelated work were not reset or deleted. |
+
+## Authentication and application-integrity phase
+
+| Check | Observed behavior |
+|---|---|
+| Product login | React renders its own username/password form. At startup it requests the CSRF cookie and then calls `/api/v1/auth/me`; it does not assume authentication until that session check succeeds. |
+| Login/logout | `/api/v1/auth/login` uses Django `authenticate()` and `login()`; `/api/v1/auth/logout` clears the Django session. Invalid credentials return a generic error and do not authenticate. |
+| CSRF and transport | Mutating API calls send `X-CSRFToken`; `credentials: "include"` is set by the shared API client. The Django middleware enforces CSRF. The Vite `/api` proxy keeps development API requests same-origin with the frontend. |
+| Cookies | `sessionid` is HttpOnly and SameSite=Lax; Secure is enabled when `AURA_ENV=production`. CSRF cookie is readable by the client for the request header and also SameSite=Lax. |
+| Django admin | `django.contrib.admin` and messages middleware are enabled and `/admin/` routes to Django admin. The configured database contains an active staff/superuser named `admin` (flags verified read-only; no credential data was inspected). Admin remains a separate interface. Django admin login and AURA API use the same session backend; this was exercised in an isolated test database. Cookie sharing depends on using the same hostname in the browser; ports do not scope host-only cookies. |
+| Anonymous access | Health/readiness, capabilities, CSRF bootstrap, login, and API index are public. Protected API resources reject unauthenticated requests with 401. |
+| Authorization limitation | AURA roles are global Django groups; there is no project membership ACL. Local admin access must not be interpreted as a production security boundary. |
+| Phase A verification | Baseline 18 tests passed. Added invalid-credential, logout/session invalidation, admin-to-API shared-session, and CORS preflight tests; full suite passed 22/22. Frontend build and Django/migration/syntax checks passed. |
+| HTTP smoke | Development server returned 200 for `/api/v1/health`, 401 for anonymous `/api/v1/auth/me`, and 302 from `/admin/` to `/admin/login/`. No browser walkthrough was performed. |
 
 ## Verified demo-record inventory after migrations
 
@@ -91,7 +105,7 @@ conversation's project, video and explicit PDF source IDs before scoring.
 | `AURA_DATABASE_PATH`, `AURA_DB_*`, `AURA_DATA_DIR`, `AURA_MEDIA_DIR`, `AURA_OUTPUT_DIR` | Existing database and file roots |
 | `AURA_RAG_MAX_PDF_MB` | New PDF limit; defaults to 25 MB |
 | `AURA_VECTOR_STORE_DIR` | New ignored runtime Chroma path; defaults to `data/vector_store/` |
-| `AURA_EMBEDDING_MODEL`, `AURA_EMBEDDING_MODEL_PATH` | Optional explicit model label and already-present local model directory; nothing is downloaded on startup |
+| `AURA_EMBEDDING_MODEL`, `AURA_EMBEDDING_MODEL_PATH`, `AURA_EMBEDDING_MODEL_REVISION` | Optional explicit model label, already-present local model directory, and revision identifier; nothing is downloaded on startup |
 | `pypdf>=5,<7` | Added to base dependencies; installed version observed was 6.21.2 |
 | `chromadb>=0.6,<2`, `sentence-transformers>=3,<6` | Optional `rag` extra; not installed during this pass |
 | `langchain`, OCR, YOLO, MLflow, PyTorch | Not installed/configured as part of this slice |
@@ -108,3 +122,60 @@ successfully.
 The synthetic PDF generator created a one-page PDF and `pypdf` extracted its
 actual text. No browser walkthrough, Chroma persistence test, embedding-model
 run, OCR, provider-backed LLM, detector inference, or deployment test was run.
+
+## Latest continuation: authentication and dense-retrieval groundwork
+
+The working branch remains `feature/1-initialize-aura-platform`. Phase A
+authentication/session behavior was exercised through new regression tests:
+invalid credentials, login and session persistence, CSRF, logout, protected
+routes, Django admin-to-API session sharing, and credentialed CORS preflight.
+The product login remains separate from `/admin/` while both use Django
+sessions.
+
+Phase B added an optional, lazy, process-cached local sentence-transformer
+adapter and persistent Chroma collections separated by model name/revision.
+Index provenance now records source checksum, chunk hash, index version, model
+revision and dimensions. Dense writes validate vector count, dimension and
+finite values; failures keep the ORM lexical index usable. Dense retrieval
+filters by project/source before vector lookup and revalidates each returned
+chunk against the current ORM scope/checksum/version. A mismatched model marks
+the dense index stale and falls back to lexical retrieval. Legacy model-only
+Chroma collections remain deletable.
+
+The optional ChromaDB and sentence-transformers packages and a local model are
+absent in this environment. The real dense adapter, embedding inference, and
+Chroma disk persistence therefore remain unverified; the currently available
+mode is `lexical_sqlite`. No new Python package dependencies were added.
+
+Before applying migration `0008`, `data/aura.db` was backed up to
+`data/aura.db.pre-phase-b-20261027-015700`. The backup is 602,112 bytes and
+its SHA-256 is
+`5D6074C255F530AE4CD4E52B3076384F9CF77754D9559290F5A002B6C1413BCD`.
+After applying `0008`, a read-only comparison against the backup found the
+same primary-key IDs and counts in every `aura_api_*` table: project 1,
+video 1, annotations 8, annotation revisions 8, ontology labels 10,
+assistant interactions 1, audit events 17, simulation runs 6, validation
+runs 1; exports, RL experiments, and all knowledge records remained zero.
+The project and video IDs remain `synthetic-demo-project` and
+`demo-video-001`.
+
+### Current Phase B verification
+
+| Command/check | Result |
+|---|---|
+| `.\\.venv\\Scripts\\python.exe manage.py migrate --noinput` | Passed; additive migration `0008_knowledgechunk_embedding_model_revision_and_more` applied |
+| `.\\.venv\\Scripts\\python.exe manage.py check` | Passed; no issues |
+| `.\\.venv\\Scripts\\python.exe manage.py makemigrations --check --dry-run` | Passed; no changes detected |
+| `.\\.venv\\Scripts\\python.exe manage.py test aura_api.tests --verbosity 2` | Passed; 27 tests, 0 failures |
+| `.\\.venv\\Scripts\\python.exe -m compileall -q backend src` | Passed |
+| `git diff --check` | Passed |
+| `Set-Location frontend; npm run build` | Passed; TypeScript and Vite production build |
+| `.\\.venv\\Scripts\\python.exe manage.py aura_evaluate_knowledge --top-k 3` | Passed; synthetic lexical fixture recall@3 1.0, citation precision 0.6, negative abstention 1.0 (3 positive, 1 negative question) |
+| HTTP smoke on local development server | Health 200; anonymous `/api/v1/auth/me` 401; capability endpoint reachable; no browser walkthrough |
+
+The synthetic evaluation is a small lexical fixture, not evidence of dense
+retrieval quality. Phases C–H (provider-backed RAG/agents, vision inference,
+medallion pipeline, supervised ML, RL expansion, and BFSI pack) have not been
+started in this continuation. Complete Phase B's real dense-inference and
+Chroma-persistence verification with intentionally provisioned optional
+dependencies and a local model before advancing to Phase C.
