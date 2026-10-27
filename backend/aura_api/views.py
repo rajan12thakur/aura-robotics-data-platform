@@ -18,12 +18,13 @@ from django.core.exceptions import ObjectDoesNotExist
 from django.middleware.csrf import get_token
 from django.db import IntegrityError, connections, transaction
 from django.db.models import Count, Max, Q
-from django.http import FileResponse, JsonResponse
+from django.http import FileResponse, HttpResponse, JsonResponse, StreamingHttpResponse
 from django.views.decorators.http import require_http_methods
 
 from annotation_processor.dataset import load_annotations
 from annotation_processor.validation import ACTION_LABELS, validate_annotations
 from . import models
+from . import data_pipeline
 from .config import (
     APP_NAME, DEFAULT_REVIEWER, FRAME_SAMPLE_LIMIT, MAX_UPLOAD_MB, MEDIA_DIR,
     OUTPUT_DIR, VISION_ENABLED, VISION_MODEL, VISION_WEIGHTS_PATH,
@@ -595,9 +596,21 @@ def upload_video(request, project_id):
     suffix = Path(filename).suffix.lower()
     if suffix not in {".mp4", ".mov", ".webm", ".mkv", ".avi"} or (uploaded.content_type and not uploaded.content_type.startswith("video/")):
         raise ApiError(415, "UNSUPPORTED_VIDEO_TYPE", "Upload a supported video file (MP4, MOV, WebM, MKV, AVI).")
+    if uploaded.size > MAX_UPLOAD_MB * 1024 * 1024:
+        raise ApiError(413, "UPLOAD_TOO_LARGE", f"Video exceeds the {MAX_UPLOAD_MB} MB limit.")
+    header = uploaded.read(32)
+    uploaded.seek(0)
+    valid_signature = (
+        (suffix in {".mp4", ".mov"} and len(header) >= 8 and header[4:8] == b"ftyp")
+        or (suffix in {".webm", ".mkv"} and header.startswith(b"\x1a\x45\xdf\xa3"))
+        or (suffix == ".avi" and len(header) >= 12 and header[:4] == b"RIFF" and header[8:12] == b"AVI ")
+    )
+    if not valid_signature:
+        raise ApiError(415, "VIDEO_SIGNATURE_INVALID", "The uploaded file content does not match a supported video format.")
     key = f"{uuid4().hex}{suffix}"
-    path = (MEDIA_DIR / key).resolve()
-    if MEDIA_DIR not in path.parents:
+    media_root = Path(MEDIA_DIR).resolve()
+    path = (media_root / key).resolve()
+    if media_root not in path.parents:
         raise ApiError(400, "INVALID_UPLOAD_PATH", "Upload path is invalid.")
     digest, size = hashlib.sha256(), 0
     try:
@@ -646,10 +659,62 @@ def video_stream(request, video_id):
     video = _video(video_id)
     if not video.storage_key:
         raise ApiError(409, "VIDEO_PLAYBACK_UNAVAILABLE", "This metadata-only registration has no managed video file.")
-    path = (MEDIA_DIR / video.storage_key).resolve()
-    if MEDIA_DIR not in path.parents or not path.is_file():
+    media_root = Path(MEDIA_DIR).resolve()
+    path = (media_root / video.storage_key).resolve()
+    if media_root not in path.parents or not path.is_file():
         raise ApiError(404, "VIDEO_FILE_UNAVAILABLE", "The managed video file is not available.")
-    return FileResponse(path.open("rb"), content_type=video.mime_type, filename=video.original_filename)
+    size = path.stat().st_size
+    range_header = request.headers.get("Range")
+    if not range_header:
+        response = FileResponse(path.open("rb"), content_type=video.mime_type, filename=video.original_filename)
+        response["Accept-Ranges"] = "bytes"
+        return response
+
+    match = re.fullmatch(r"bytes=(\d*)-(\d*)", range_header.strip())
+    if not match or size == 0:
+        response = HttpResponse(status=416)
+        response["Content-Range"] = f"bytes */{size}"
+        response["Accept-Ranges"] = "bytes"
+        return response
+    first, last = match.groups()
+    if not first:
+        suffix_length = int(last or 0)
+        if suffix_length <= 0:
+            response = HttpResponse(status=416)
+            response["Content-Range"] = f"bytes */{size}"
+            response["Accept-Ranges"] = "bytes"
+            return response
+        start = max(0, size - suffix_length)
+        end = size - 1
+    else:
+        start = int(first)
+        end = min(int(last), size - 1) if last else size - 1
+    if start >= size or end < start:
+        response = HttpResponse(status=416)
+        response["Content-Range"] = f"bytes */{size}"
+        response["Accept-Ranges"] = "bytes"
+        return response
+
+    length = end - start + 1
+
+    def content_chunks():
+        with path.open("rb") as media:
+            media.seek(start)
+            remaining = length
+            while remaining:
+                chunk = media.read(min(64 * 1024, remaining))
+                if not chunk:
+                    break
+                remaining -= len(chunk)
+                yield chunk
+
+    response = StreamingHttpResponse(
+        content_chunks(), status=206, content_type=video.mime_type,
+    )
+    response["Content-Length"] = str(length)
+    response["Content-Range"] = f"bytes {start}-{end}/{size}"
+    response["Accept-Ranges"] = "bytes"
+    return response
 
 
 @api
@@ -788,23 +853,24 @@ def annotation_detail(request, annotation_id):
     return JsonResponse(_json(row))
 
 
-@api
-@require_http_methods(["POST"])
-def import_annotations(request, video_id):
-    video = _video(video_id)
-    uploaded = request.FILES.get("file")
+def _validate_annotation_import(request, video, uploaded):
     _require_role(request, "annotation_write")
     if not uploaded:
         raise ApiError(400, "MISSING_IMPORT", "Select a CSV or JSON annotation file.")
     if uploaded.size > 10 * 1024 * 1024:
         raise ApiError(413, "IMPORT_TOO_LARGE", "Import is limited to 10 MB.")
+    file_format = Path(uploaded.name).suffix.lstrip(".").lower()
+    if file_format not in {"csv", "json"}:
+        raise ApiError(415, "IMPORT_FORMAT_UNSUPPORTED", "Choose a .csv or .json annotation file.")
     try:
         content = uploaded.read().decode("utf-8-sig")
-        rows, issues = load_annotations(io.StringIO(content), Path(uploaded.name).suffix.lstrip(".") or "csv")
+        rows, issues = load_annotations(io.StringIO(content), file_format)
     except UnicodeError:
         raise ApiError(400, "INVALID_ENCODING", "Import file must be UTF-8 encoded.")
     except ValueError as exc:
         raise ApiError(400, "INVALID_IMPORT_FORMAT", str(exc))
+    if len(rows) > 5000:
+        raise ApiError(413, "IMPORT_RECORD_LIMIT", "An import may contain at most 5,000 annotation records.")
     for row in rows:
         if row.get("video_id") not in (video.id, video.original_filename, Path(uploaded.name).stem):
             issues.append({"code": "UNKNOWN_VIDEO_REFERENCE", "severity": "error", "message": "Imported row refers to a different video; import is atomic.", "source_row": row.get("_source_row")})
@@ -814,12 +880,79 @@ def import_annotations(request, video_id):
         ).exists():
             issues.append({"code": "UNKNOWN_ACTION_LABEL", "severity": "error", "message": "Action label is not active in the project's ontology version.", "source_row": row.get("_source_row")})
     issues += validate_annotations(rows, durations={video.id: video.duration_seconds}, known_videos={video.id})
+    existing = {
+        (row.start_time, row.end_time, row.action_label, row.object_label or "", row.actor_id or "")
+        for row in models.Annotation.objects.filter(video=video, archived_at__isnull=True)
+    }
+    new_rows = []
+    duplicate_count = 0
+    seen = set()
+    duplicate_source_rows = set()
+    for row in rows:
+        try:
+            fingerprint = (
+                float(row["start_time"]), float(row["end_time"]),
+                row["action_label"], row.get("object_label") or "",
+                row.get("actor_id") or "",
+            )
+        except (KeyError, TypeError, ValueError):
+            continue
+        if fingerprint in existing or fingerprint in seen:
+            duplicate_count += 1
+            duplicate_source_rows.add(row.get("_source_row"))
+            issues.append({
+                "code": "DUPLICATE_ANNOTATION_SKIPPED",
+                "severity": "warning",
+                "message": "An identical annotation already exists or was seen earlier in this file; this row will be skipped.",
+                "source_row": row.get("_source_row"),
+            })
+            continue
+        seen.add(fingerprint)
+        new_rows.append(row)
+    if duplicate_source_rows:
+        for issue in issues:
+            if issue.get("code") == "DUPLICATE_ANNOTATION" and issue.get("source_row") in duplicate_source_rows:
+                issue["severity"] = "warning"
+    return content, rows, new_rows, issues, duplicate_count
+
+
+@api
+@require_http_methods(["POST"])
+def import_annotations_preview(request, video_id):
+    video = _video(video_id)
+    content, rows, new_rows, issues, duplicate_count = _validate_annotation_import(
+        request, video, request.FILES.get("file"),
+    )
+    return JsonResponse({
+        "video_id": video.id,
+        "total_records": len(rows),
+        "importable_count": len(new_rows),
+        "skipped_duplicate_count": duplicate_count,
+        "rejected_count": sum(issue.get("severity") == "error" for issue in issues),
+        "issues": issues[:500],
+        "preview": [{
+            key: row.get(key) for key in (
+                "video_id", "start_time", "end_time", "action_label",
+                "object_label", "actor_id", "confidence", "notes",
+            )
+        } for row in new_rows[:10]],
+        "content_sha256": hashlib.sha256(content.encode("utf-8")).hexdigest(),
+    })
+
+
+@api
+@require_http_methods(["POST"])
+def import_annotations(request, video_id):
+    video = _video(video_id)
+    content, rows, new_rows, issues, duplicate_count = _validate_annotation_import(
+        request, video, request.FILES.get("file"),
+    )
     if any(item.get("severity") == "error" for item in issues):
         return JsonResponse({"error": {"code": "IMPORT_VALIDATION_FAILED", "message": "No annotations were imported because the file contains errors.", "details": {"issues": issues}}}, status=422)
     with transaction.atomic():
         created_rows = models.Annotation.objects.bulk_create([
             models.Annotation(project=video.project, video=video, start_time=_finite_number(row["start_time"], "start_time"), end_time=_finite_number(row["end_time"], "end_time"), action_label=row["action_label"], object_label=row.get("object_label"), actor_id=row.get("actor_id"), confidence=_finite_number(row["confidence"], "confidence") if row.get("confidence") not in (None, "") else None, notes=row.get("notes"), source="imported", status="draft")
-            for row in rows
+            for row in new_rows
         ])
         for annotation in created_rows:
             annotation.created_by = request.user.get_username()
@@ -827,8 +960,13 @@ def import_annotations(request, video_id):
             annotation.schema_version = video.project.annotation_policy_version
             annotation.save(update_fields=["created_by", "updated_by", "schema_version"])
             _snapshot_annotation(annotation, request.user.get_username(), "Imported annotation")
-        _audit(video.project, "annotation.imported", f"Imported {len(rows)} annotation(s) from a file.", request.user.get_username(), video_id=video.id, count=len(rows), checksum_sha256=hashlib.sha256(content.encode("utf-8")).hexdigest())
-    return JsonResponse({"imported_count": len(rows), "issues": issues})
+        _audit(video.project, "annotation.imported", f"Imported {len(created_rows)} annotation(s) from a file.", request.user.get_username(), video_id=video.id, count=len(created_rows), skipped_duplicates=duplicate_count, checksum_sha256=hashlib.sha256(content.encode("utf-8")).hexdigest())
+    return JsonResponse({
+        "imported_count": len(created_rows),
+        "skipped_duplicate_count": duplicate_count,
+        "rejected_count": 0,
+        "issues": issues[:500],
+    })
 
 
 @api
@@ -1106,6 +1244,35 @@ def export_detail(request, export_id):
     result = _json(item)
     result["manifest"] = json.loads(item.manifest_json)
     return JsonResponse(result)
+
+
+@api
+@require_http_methods(["GET", "POST"])
+def project_pipeline_runs(request, project_id):
+    project = _project(project_id)
+    if request.method == "GET":
+        return JsonResponse(data_pipeline.list_pipeline_runs(project.id), safe=False)
+    _require_role(request, "quality")
+    try:
+        result = data_pipeline.run_pipeline(project.id)
+    except Exception as exc:
+        _audit(
+            project,
+            "pipeline.run.failed",
+            f"Medallion pipeline failed ({type(exc).__name__}).",
+            request.user.get_username(),
+        )
+        raise
+    _audit(
+        project,
+        "pipeline.run.succeeded" if result["status"] == "succeeded" else "pipeline.run.failed",
+        f"Medallion pipeline {result['status']} for batch {result['batch_id']}.",
+        request.user.get_username(),
+        batch_id=result["batch_id"],
+        input_sha256=result["input_sha256"],
+        output_counts=result["output_counts"],
+    )
+    return JsonResponse(result, status=200 if result["status"] == "succeeded" else 503)
 
 
 @api

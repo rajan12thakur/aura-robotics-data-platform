@@ -7,13 +7,14 @@ from unittest.mock import patch
 
 from django.contrib.auth.models import Group, User
 from django.core.files.uploadedfile import SimpleUploadedFile
+from django.core.management import call_command
 from django.test import Client, TestCase
 from pypdf import PdfWriter
 from pypdf.generic import DecodedStreamObject, DictionaryObject, NameObject
 
-from . import knowledge_service, views
+from . import data_pipeline, knowledge_service, views
 from .models import (
-    Annotation, AnnotationRevision, DatasetExport, KnowledgeChunk, KnowledgeConversation,
+    Annotation, AnnotationRevision, AuditEvent, DatasetExport, KnowledgeChunk, KnowledgeConversation,
     KnowledgeSource, Project, RLExperiment, Video,
 )
 from .rl import GridPickPlace, run_experiment
@@ -447,6 +448,155 @@ class AuraApiTests(TestCase):
         self.assertEqual(response.status_code, 415)
         self.assertFalse(KnowledgeSource.objects.exists())
 
+    def test_video_upload_checks_content_safely_stores_and_streams_ranges(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        media_dir = Path(temporary.name)
+        content = b"\x00\x00\x00\x18ftypisom" + b"synthetic-video-data"
+        with patch("aura_api.views.MEDIA_DIR", media_dir):
+            upload = SimpleUploadedFile(
+                "..\\unsafe-name.mp4", content, content_type="video/mp4",
+            )
+            response = self.client.post(
+                f"/api/v1/projects/{self.project.id}/videos", {"file": upload},
+            )
+            self.assertEqual(response.status_code, 201, response.content)
+            video = Video.objects.get(pk=response.json()["id"])
+            self.assertEqual(video.original_filename, "unsafe-name.mp4")
+            self.assertTrue(video.storage_key)
+            self.assertNotIn("unsafe-name", video.storage_key)
+            self.assertEqual(video.checksum_sha256, hashlib.sha256(content).hexdigest())
+            self.assertTrue((media_dir / video.storage_key).is_file())
+
+            stream = self.client.get(
+                f"/api/v1/videos/{video.id}/stream",
+                HTTP_RANGE="bytes=4-11",
+            )
+            self.assertEqual(stream.status_code, 206)
+            self.assertEqual(stream["Content-Range"], f"bytes 4-11/{len(content)}")
+            self.assertEqual(stream["Content-Length"], "8")
+            self.assertEqual(b"".join(stream.streaming_content), content[4:12])
+            stream.close()
+
+            invalid = SimpleUploadedFile(
+                "fake.mp4", b"not a video", content_type="video/mp4",
+            )
+            rejected = self.client.post(
+                f"/api/v1/projects/{self.project.id}/videos", {"file": invalid},
+            )
+            self.assertEqual(rejected.status_code, 415)
+            self.assertEqual(rejected.json()["error"]["code"], "VIDEO_SIGNATURE_INVALID")
+            self.assertEqual(Video.objects.count(), 2)
+
+    def test_pipeline_builds_idempotent_medallion_outputs_and_quarantines_bad_rows(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        first = Annotation.objects.create(
+            project=self.project, video=self.video,
+            start_time=1, end_time=2, action_label="reach",
+            object_label="part", actor_id="annotator", status="approved",
+        )
+        duplicate = Annotation.objects.create(
+            project=self.project, video=self.video,
+            start_time=1, end_time=2, action_label="reach",
+            object_label="part", actor_id="annotator", status="approved",
+        )
+        invalid = Annotation.objects.create(
+            project=self.project, video=self.video,
+            start_time=3, end_time=4, action_label="unknown-label",
+            status="draft",
+        )
+        pipeline_root = Path(temporary.name)
+        with patch.object(data_pipeline, "PIPELINE_DIR", pipeline_root):
+            result = data_pipeline.run_pipeline(self.project.id)
+            self.assertEqual(result["status"], "succeeded")
+            self.assertEqual(result["output_counts"], {
+                "bronze": 3, "silver": 1, "quarantined": 2,
+            })
+            self.assertEqual(result["gold"]["class_balance"], {"reach": 1})
+            self.assertTrue(result["gold"]["dataset_export_ready"])
+            self.assertNotIn("storage_key", json.dumps(result))
+            silver_path = pipeline_root / result["outputs"]["silver.json"]
+            silver_rows = json.loads(silver_path.read_text(encoding="utf-8"))
+            self.assertIn(silver_rows[0]["annotation_id"], {first.id, duplicate.id})
+            self.assertNotIn("notes", silver_rows[0])
+            quarantine = json.loads(
+                (pipeline_root / result["outputs"]["quarantine.json"]).read_text(encoding="utf-8"),
+            )
+            reasons = {reason for item in quarantine for reason in item["reasons"]}
+            self.assertIn("duplicate_annotation", reasons)
+            self.assertIn("unknown_action_label", reasons)
+
+            repeated = data_pipeline.run_pipeline(self.project.id)
+            self.assertEqual(repeated, result)
+            (pipeline_root / result["outputs"]["gold.json"]).write_text("tampered", encoding="utf-8")
+            repaired = data_pipeline.run_pipeline(self.project.id)
+            self.assertEqual(repaired["batch_id"], result["batch_id"])
+            self.assertEqual(
+                hashlib.sha256((pipeline_root / result["outputs"]["gold.json"]).read_bytes()).hexdigest(),
+                result["output_sha256"]["gold.json"],
+            )
+        self.assertTrue(Annotation.objects.filter(pk=invalid.id).exists())
+
+    def test_pipeline_records_failure_and_successful_retry(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        pipeline_root = Path(temporary.name)
+        original_write = data_pipeline._write_atomic
+        failed_once = False
+
+        def fail_on_silver(path, content):
+            nonlocal failed_once
+            if path.name == "silver.json" and not failed_once:
+                failed_once = True
+                raise OSError("synthetic write failure")
+            return original_write(path, content)
+
+        with patch.object(data_pipeline, "PIPELINE_DIR", pipeline_root):
+            with patch.object(data_pipeline, "_write_atomic", side_effect=fail_on_silver):
+                with self.assertRaises(OSError):
+                    data_pipeline.run_pipeline(self.project.id)
+            runs = data_pipeline.list_pipeline_runs(self.project.id)
+            self.assertEqual(runs[0]["status"], "failed")
+            self.assertIn("OSError", runs[0]["error_summary"])
+            retried = data_pipeline.run_pipeline(self.project.id)
+            self.assertEqual(retried["status"], "succeeded")
+            self.assertEqual(retried["output_counts"]["silver"], 0)
+
+    def test_pipeline_api_persists_run_metadata_and_requires_quality_role(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        with patch.object(data_pipeline, "PIPELINE_DIR", Path(temporary.name)):
+            response = self.client.post(f"/api/v1/projects/{self.project.id}/pipeline/runs")
+            self.assertEqual(response.status_code, 200, response.content)
+            self.assertEqual(response.json()["status"], "succeeded")
+            self.assertEqual(response.json()["output_counts"]["silver"], 0)
+            self.assertFalse(response.json()["gold"]["dataset_export_ready"])
+            history = self.client.get(f"/api/v1/projects/{self.project.id}/pipeline/runs")
+            self.assertEqual(history.status_code, 200)
+            self.assertEqual(history.json()[0]["batch_id"], response.json()["batch_id"])
+            self.assertTrue(AuditEvent.objects.filter(
+                project=self.project, event_type="pipeline.run.succeeded",
+            ).exists())
+        auditor = User.objects.create_user(username="pipeline-no-role")
+        self.client.force_login(auditor)
+        forbidden = self.client.post(f"/api/v1/projects/{self.project.id}/pipeline/runs")
+        self.assertEqual(forbidden.status_code, 403)
+
+    def test_pipeline_management_command_emits_run_manifest_json(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        output = io.StringIO()
+        with patch.object(data_pipeline, "PIPELINE_DIR", Path(temporary.name)):
+            call_command(
+                "aura_run_pipeline",
+                project_id=self.project.id,
+                stdout=output,
+            )
+        manifest = json.loads(output.getvalue())
+        self.assertEqual(manifest["project_id"], self.project.id)
+        self.assertEqual(manifest["status"], "succeeded")
+
     def test_project_knowledge_retrieval_does_not_cross_project_boundary(self):
         foreign_project = Project.objects.create(name="Separate project")
         source = KnowledgeSource.objects.create(
@@ -638,6 +788,50 @@ class AuraApiTests(TestCase):
         self.assertEqual(response.status_code, 422)
         self.assertEqual(response.json()["error"]["code"], "IMPORT_VALIDATION_FAILED")
         self.assertEqual(Annotation.objects.filter(video=self.video).count(), 0)
+
+    def test_import_preview_is_non_mutating_and_commit_skips_duplicate_rows(self):
+        content = (
+            "video_id,start_time,end_time,action_label\n"
+            f"{self.video.id},1,2,reach\n"
+            f"{self.video.id},1,2,reach\n"
+        )
+        preview_file = SimpleUploadedFile(
+            "annotations.csv", content.encode(), content_type="text/csv",
+        )
+        preview = self.client.post(
+            f"/api/v1/videos/{self.video.id}/annotations/import/preview",
+            {"file": preview_file},
+        )
+        self.assertEqual(preview.status_code, 200, preview.content)
+        self.assertEqual(preview.json()["total_records"], 2)
+        self.assertEqual(preview.json()["importable_count"], 1)
+        self.assertEqual(preview.json()["skipped_duplicate_count"], 1)
+        self.assertEqual(Annotation.objects.filter(video=self.video).count(), 0)
+
+        upload = SimpleUploadedFile(
+            "annotations.csv", content.encode(), content_type="text/csv",
+        )
+        committed = self.client.post(
+            f"/api/v1/videos/{self.video.id}/annotations/import",
+            {"file": upload},
+        )
+        self.assertEqual(committed.status_code, 200, committed.content)
+        self.assertEqual(committed.json()["imported_count"], 1)
+        self.assertEqual(committed.json()["skipped_duplicate_count"], 1)
+        self.assertEqual(Annotation.objects.filter(video=self.video).count(), 1)
+
+        repeated = SimpleUploadedFile(
+            "annotations.csv", content.splitlines()[0].encode() + b"\n"
+            + f"{self.video.id},1,2,reach\n".encode(),
+            content_type="text/csv",
+        )
+        duplicate_preview = self.client.post(
+            f"/api/v1/videos/{self.video.id}/annotations/import/preview",
+            {"file": repeated},
+        )
+        self.assertEqual(duplicate_preview.status_code, 200)
+        self.assertEqual(duplicate_preview.json()["importable_count"], 0)
+        self.assertEqual(duplicate_preview.json()["skipped_duplicate_count"], 1)
 
     def test_review_requires_reason_and_prevents_maker_checker(self):
         row = Annotation.objects.create(

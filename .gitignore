@@ -224,6 +224,7 @@ data/aura.db
 data/aura.db-*
 data/vector_store/
 data/models/
+data/pipelines/
 data/media/*
 !data/media/.gitkeep
 output/reports/*

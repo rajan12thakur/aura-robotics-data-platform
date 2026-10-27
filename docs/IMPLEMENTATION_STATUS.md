@@ -9,7 +9,7 @@ and commands; optional dependencies and unrun capabilities are labelled.
 | Audit item | Observed evidence |
 |---|---|
 | Branch and recent history | Branch `feature/1-initialize-aura-platform`; latest commit at this audit was `98724f9` (`phase 1 done`). No commit/push was made for this phase. |
-| Worktree | Initially contained only untracked `frontend/.vite/`; it was preserved. This phase modified `README.md`, `backend/aura_api/tests.py`, and the two implementation reports. |
+| Worktree | The current continuation preserves pre-existing files and local database/media; it adds video upload/stream and import-preview coverage plus a local medallion pipeline. |
 | Runtime | Python 3.11.0, Django 5.2.18, Node 22.20.0, npm 10.9.3. |
 | Framework/package baseline | Django ORM, SQLite default, React 18, TypeScript, Vite. Base project dependencies were Django and django-cors-headers; `pypdf` was added for this slice. |
 | Database migrations | Applied `0001` through `0005` before this slice; forward migrations `0006_knowledgechunk_knowledgeconversation_and_more` and `0007_knowledgechunk_embedding_dimensions_and_more` are now applied. |
@@ -91,7 +91,7 @@ conversation's project, video and explicit PDF source IDs before scoring.
 | React Video & Document Chat | `frontend/src/KnowledgeWorkspace.tsx`, API client and typed models | Implemented in lexical mode; production build passed after final metadata update | No browser walkthrough; no progress meter for upload; citation drawer shows snippets/page/timestamp but does not render PDF or seek video | Browser test after local server setup | `npm run build` passed |
 | ChromaDB / sentence-transformers | Optional `rag` extra; `src/aura_rag/vector.py` lazily opens persistent Chroma and local-only configured model | Implemented but not installed or fully verified | Model files are not bundled/downloaded; current `chromadb` and `sentence_transformers` modules are absent | Install `python -m pip install -e ".[rag]"`, explicitly prepare local model directory, run adapter persistence/scoping tests | Capability reports `lexical_sqlite`; no dense result claimed |
 | LLM / LangChain / tools | Current implementation uses deterministic extractive answers; no external provider | Not implemented beyond deterministic fallback | No LangChain chain/agent, external LLM, tool traces, evaluation | Keep no-key fallback; design safe provider/agent as a separate phase | No provider calls made |
-| Medallion pipeline | No Bronze/Silver/Gold job models or artifact workflow | Not implemented | No durable ETL, quarantine, retries, lineage outputs | Implement the next full vertical slice after RAG foundation | Not tested |
+| Medallion pipeline | `backend/aura_api/data_pipeline.py`, CLI command, project API and Data Pipeline workspace | Implemented; JSON/CSV artifacts | Local synchronous jobs only; no Parquet engine, persisted ORM job table, scheduled queue, or split-leakage analytics | Add durable queued execution and Parquet only when operational needs justify them | Synthetic valid/invalid/quarantine, idempotency, artifact repair, failure/retry, empty-input and authorization tests |
 | CV detector/object annotation | Optional OpenCV metadata only; no configured weights | Not implemented for inference | No YOLO adapter, boxes/tracks, CV evaluation | Add only with explicit local model configuration and human review | No detector was run |
 | Supervised ML/PyTorch/DQN | No supervised model registry or PyTorch training path | Not implemented | No dataset/split/model artifacts | Define a defensible labeled task and testable baseline | Not run |
 | BFSI pack | No separate BFSI models or UI | Not implemented | No synthetic document processing/review domain | Implement isolated domain pack after shared sources/ETL are mature | Not run |
@@ -105,6 +105,7 @@ conversation's project, video and explicit PDF source IDs before scoring.
 | `AURA_DATABASE_PATH`, `AURA_DB_*`, `AURA_DATA_DIR`, `AURA_MEDIA_DIR`, `AURA_OUTPUT_DIR` | Existing database and file roots |
 | `AURA_RAG_MAX_PDF_MB` | New PDF limit; defaults to 25 MB |
 | `AURA_VECTOR_STORE_DIR` | New ignored runtime Chroma path; defaults to `data/vector_store/` |
+| `AURA_PIPELINE_DIR` | Ignored local Bronze/Silver/Gold artifact root; defaults to `data/pipelines/` |
 | `AURA_EMBEDDING_MODEL`, `AURA_EMBEDDING_MODEL_PATH`, `AURA_EMBEDDING_MODEL_REVISION` | Optional explicit model label, already-present local model directory, and revision identifier; nothing is downloaded on startup |
 | `pypdf>=5,<7` | Added to base dependencies; installed version observed was 6.21.2 |
 | `chromadb>=0.6,<2`, `sentence-transformers>=3,<6` | Optional `rag` extra; not installed during this pass |
@@ -147,6 +148,18 @@ absent in this environment. The real dense adapter, embedding inference, and
 Chroma disk persistence therefore remain unverified; the currently available
 mode is `lexical_sqlite`. No new Python package dependencies were added.
 
+### Current continuation: video integrity and medallion processing
+
+Managed video upload validates basic container signatures and streams bounded
+byte ranges for browser seeking. Annotation imports now have a non-mutating
+preview, duplicate reporting, and server-side revalidation at commit. A
+project-scoped, bounded pipeline writes Bronze JSON, typed/deduplicated Silver
+JSON/CSV, quarantine reasons, Gold counts/class balance/review/overlap metrics,
+and SHA-256 lineage manifests. Successful inputs reuse checksum-verified
+outputs; damaged artifacts are regenerated; failed output runs are recorded
+and retryable. API runs require a quality-capable role and are audited. No
+database schema was added or changed for these workflows.
+
 Before applying migration `0008`, `data/aura.db` was backed up to
 `data/aura.db.pre-phase-b-20261027-015700`. The backup is 602,112 bytes and
 its SHA-256 is
@@ -159,7 +172,7 @@ runs 1; exports, RL experiments, and all knowledge records remained zero.
 The project and video IDs remain `synthetic-demo-project` and
 `demo-video-001`.
 
-### Current Phase B verification
+### Phase B verification at completion
 
 | Command/check | Result |
 |---|---|
@@ -174,8 +187,40 @@ The project and video IDs remain `synthetic-demo-project` and
 | HTTP smoke on local development server | Health 200; anonymous `/api/v1/auth/me` 401; capability endpoint reachable; no browser walkthrough |
 
 The synthetic evaluation is a small lexical fixture, not evidence of dense
-retrieval quality. Phases C–H (provider-backed RAG/agents, vision inference,
-medallion pipeline, supervised ML, RL expansion, and BFSI pack) have not been
-started in this continuation. Complete Phase B's real dense-inference and
-Chroma-persistence verification with intentionally provisioned optional
-dependencies and a local model before advancing to Phase C.
+retrieval quality. The then-current Phase B handoff did not include provider
+RAG/agents, vision inference, medallion processing, supervised ML, or the BFSI
+pack. The current continuation below adds the medallion slice but does not
+complete those other phases.
+
+## Current continuation: video integrity and medallion pipeline
+
+Managed video upload validates basic container signatures and streams bounded
+byte ranges. Annotation import supports a non-mutating preview, duplicate
+reporting, and duplicate skipping after server-side commit revalidation. The
+new local pipeline uses Django ORM project/video/annotation records and emits
+input-hash-addressed Bronze JSON, typed/deduplicated Silver JSON/CSV,
+quarantine reasons, Gold metrics, and checksum manifests. It verifies all
+output hashes before reusing a successful batch, repairs missing/corrupt
+artifacts, and records failed runs for retry. CLI, authenticated role-gated
+API, audit logging, typed React client, and Data Pipeline page are present.
+The implementation adds no schema migration or optional Python dependency.
+
+Latest validation: 33 Django tests passed; the focused pipeline, upload, and
+import-preview tests passed; `manage.py check`,
+`makemigrations --check --dry-run`, `showmigrations`, `compileall`,
+`git diff --check`, and the frontend production build passed. No live browser
+walkthrough was performed.
+
+The active database was read using SQLite read-only mode: 1 project, 3 videos,
+8 annotations, 8 revisions, 10 ontology labels, 0 exports, 0 RL experiments,
+1 knowledge source, 0 conversations, and 20 audit events. The project and
+annotation IDs match the documented inventory, and `demo-video-001` remains
+present. The prior documented inventory recorded no knowledge sources and
+19 audit events. This discrepancy's origin is unknown; no current-run write,
+migration, seed, or pipeline execution was made against the active database.
+
+Still incomplete: configured dense retrieval/Chroma runtime verification,
+provider-backed RAG and safe agent tools, real CV inference, supervised ML,
+DQN, synthetic BFSI workflows, production hardening, and browser validation.
+The pipeline is local/synchronous JSON/CSV, not a queued Parquet or
+distributed ETL platform.

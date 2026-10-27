@@ -180,3 +180,29 @@ export interface KnowledgeAnswer {
   warnings: string[];
   messages: KnowledgeMessage[];
 }
+
+export interface PipelineRun {
+  batch_id: string;
+  project_id: string;
+  status: "succeeded" | "failed";
+  schema_version: string;
+  source: string;
+  input_sha256: string;
+  input_counts: { videos: number; annotations: number };
+  output_counts: { bronze: number; silver: number; quarantined: number };
+  outputs: Record<string, string>;
+  output_sha256: Record<string, string>;
+  gold: {
+    annotation_count: number;
+    video_count: number;
+    class_balance: Record<string, number>;
+    review_status_counts: Record<string, number>;
+    annotations_per_video: Record<string, number>;
+    annotation_throughput_by_day: Record<string, number>;
+    overlapping_intervals: number;
+    dataset_export_ready: boolean;
+  };
+  started_at: string;
+  duration_ms: number;
+  error_summary: string;
+}
