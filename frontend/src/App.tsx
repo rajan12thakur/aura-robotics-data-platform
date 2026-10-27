@@ -6,12 +6,13 @@ import {
 } from "lucide-react";
 import { ApiError, api, type AuthUser } from "./api/client";
 import KnowledgeWorkspace from "./KnowledgeWorkspace";
-import type { Annotation, Project, RLExperiment, RLEnvironment, ValidationRun, Video as VideoAsset } from "./types/models";
+import type { Annotation, PipelineRun, Project, RLExperiment, RLEnvironment, ValidationRun, Video as VideoAsset } from "./types/models";
 
-type Page = "Overview" | "Projects" | "Annotation Workspace" | "Dataset Quality" | "AI Assistant" | "Video & Document Chat" | "Simulation" | "Policy & Guidelines" | "Audit Trail" | "Settings";
+type Page = "Overview" | "Projects" | "Annotation Workspace" | "Dataset Quality" | "Data Pipeline" | "AI Assistant" | "Video & Document Chat" | "Simulation" | "Policy & Guidelines" | "Audit Trail" | "Settings";
 const pages: Array<{ name: Page; icon: typeof Activity }> = [
   { name: "Overview", icon: Gauge }, { name: "Projects", icon: FolderKanban },
   { name: "Annotation Workspace", icon: Video }, { name: "Dataset Quality", icon: ClipboardCheck },
+  { name: "Data Pipeline", icon: Activity },
   { name: "AI Assistant", icon: Bot }, { name: "Video & Document Chat", icon: FileSearch }, { name: "Simulation", icon: Boxes },
   { name: "Policy & Guidelines", icon: ShieldCheck }, { name: "Audit Trail", icon: History },
   { name: "Settings", icon: Settings2 },
@@ -39,6 +40,8 @@ export default function App() {
   const [policy, setPolicy] = useState<any>(null);
   const [simulation, setSimulation] = useState<any>(null);
   const [rlExperiments, setRlExperiments] = useState<RLExperiment[]>([]);
+  const [pipelineRuns, setPipelineRuns] = useState<PipelineRun[]>([]);
+  const [pipelineBusy, setPipelineBusy] = useState(false);
   const [rlEnvironment, setRlEnvironment] = useState<RLEnvironment | null>(null);
   const [rlForm, setRlForm] = useState({ episodes: "500", seed: "7" });
   const [loading, setLoading] = useState(false);
@@ -51,6 +54,8 @@ export default function App() {
   const [currentTime, setCurrentTime] = useState(0);
   const [editingId, setEditingId] = useState("");
   const videoElement = useRef<HTMLVideoElement>(null);
+  const [importPreview, setImportPreview] = useState<any>(null);
+  const [importFile, setImportFile] = useState<File | null>(null);
   const [assistantQuestion, setAssistantQuestion] = useState("");
   const [assistantResult, setAssistantResult] = useState<any>(null);
   const [policyQuery, setPolicyQuery] = useState("");
@@ -62,6 +67,7 @@ export default function App() {
   const canReview = roles.some((role) => ["Administrator", "Reviewer"].includes(role));
   const canExport = roles.some((role) => ["Administrator", "Dataset Manager"].includes(role));
   const canRunExperiment = roles.some((role) => ["Administrator", "Project Manager", "ML Engineer"].includes(role));
+  const canRunPipeline = roles.some((role) => ["Administrator", "Project Manager", "Annotator", "Reviewer", "Dataset Manager"].includes(role));
 
   const notifyError = (reason: unknown) => {
     setError(reason instanceof ApiError ? `${reason.message} (${reason.code})` : reason instanceof Error ? reason.message : "Unexpected request failure.");
@@ -123,6 +129,11 @@ export default function App() {
     if (!authenticated) return;
     loadAnnotations().catch(notifyError);
   }, [authenticated, loadAnnotations]);
+
+  useEffect(() => {
+    if (!authenticated || page !== "Data Pipeline" || !projectId) return;
+    api.pipelineRuns(projectId).then(setPipelineRuns).catch(notifyError);
+  }, [authenticated, page, projectId]);
 
   async function signIn(event: React.FormEvent) {
     event.preventDefault();
@@ -212,11 +223,23 @@ export default function App() {
     const file = event.target.files?.[0];
     if (!file || !videoId) return;
     try {
-      const result = await api.importAnnotations(videoId, file);
-      await Promise.all([loadAnnotations(), loadProjectData()]);
-      setNotice(`Imported ${result.imported_count} annotation(s).`);
+      const preview = await api.importAnnotations(videoId, file, true);
+      setImportFile(file);
+      setImportPreview(preview);
+      setNotice(`Import preview ready: ${preview.importable_count} row(s) can be added.`);
     } catch (reason) { notifyError(reason); }
     finally { event.target.value = ""; }
+  }
+
+  async function commitAnnotationImport() {
+    if (!videoId || !importFile || !importPreview || importPreview.rejected_count) return;
+    try {
+      const result = await api.importAnnotations(videoId, importFile);
+      await Promise.all([loadAnnotations(), loadProjectData()]);
+      setNotice(`Imported ${result.imported_count} annotation(s); skipped ${result.skipped_duplicate_count} duplicate(s).`);
+      setImportFile(null);
+      setImportPreview(null);
+    } catch (reason) { notifyError(reason); }
   }
 
   async function saveAnnotation(event: React.FormEvent) {
@@ -297,6 +320,22 @@ export default function App() {
       setNotice(`${algorithm === "q_learning" ? "Q-learning" : "Baseline"} run completed. Evaluation success: ${(result.metrics.evaluation.learned_policy.success_rate * 100).toFixed(0)}%.`);
     } catch (reason) { notifyError(reason); }
     finally { setLoading(false); }
+  }
+
+  async function runDataPipeline() {
+    if (!projectId || !window.confirm(
+      "Create a local Bronze/Silver/Gold snapshot from this project's current records? Verified batches are reused; missing or corrupted artifacts may be regenerated.",
+    )) return;
+    setPipelineBusy(true);
+    try {
+      const result = await api.runPipeline(projectId);
+      setPipelineRuns((current) => [
+        result,
+        ...current.filter((item) => item.batch_id !== result.batch_id),
+      ]);
+      setNotice(`Pipeline ${result.status}: ${result.output_counts.silver} accepted, ${result.output_counts.quarantined} quarantined.`);
+    } catch (reason) { notifyError(reason); }
+    finally { setPipelineBusy(false); }
   }
 
   const barDuration = Math.max(selectedVideo?.duration_seconds ?? 0, ...annotations.map((item) => item.end_time), 1);
@@ -390,6 +429,13 @@ export default function App() {
                   <div className="no-video"><FileVideo2 size={24} /><strong>{selectedVideo ? "Metadata-only video registration" : "No video selected"}</strong><span>{selectedVideo ? "Playback is unavailable because no managed file was uploaded. Annotations can still be created using known timestamps." : "Upload a managed video or register external metadata to begin."}</span></div>}
                 <form className="register-form" onSubmit={registerVideo}><strong>Register video metadata</strong><Field label="Filename"><input required maxLength={255} placeholder="demonstration.mp4" value={videoForm.original_filename} onChange={(e) => setVideoForm({ ...videoForm, original_filename: e.target.value })} /></Field><Field label="Duration (seconds)"><input type="number" min="0.01" step="any" placeholder="Optional" value={videoForm.duration_seconds} onChange={(e) => setVideoForm({ ...videoForm, duration_seconds: e.target.value })} /></Field><button className="button secondary" type="submit">Register</button></form>
               </div>
+              {importPreview && <div className="panel" role="region" aria-label="Annotation import preview">
+                <h3>Import preview</h3>
+                <p>{importPreview.total_records} row(s) parsed · {importPreview.importable_count} new · {importPreview.skipped_duplicate_count} duplicate(s) to skip · {importPreview.rejected_count} error(s)</p>
+                {importPreview.preview.length > 0 && <div className="table-scroll"><table><thead><tr><th>Start</th><th>End</th><th>Action</th><th>Object</th></tr></thead><tbody>{importPreview.preview.map((row: any, index: number) => <tr key={`${row.start_time}-${index}`}><td>{row.start_time}</td><td>{row.end_time}</td><td>{row.action_label}</td><td>{row.object_label || "—"}</td></tr>)}</tbody></table></div>}
+                {importPreview.issues.length > 0 && <ul>{importPreview.issues.slice(0, 20).map((issue: any, index: number) => <li key={`${issue.code}-${index}`}>{issue.severity}: {issue.message}{issue.source_row ? ` (row ${issue.source_row})` : ""}</li>)}</ul>}
+                <div className="button-row"><button type="button" className="button primary" disabled={!importFile || importPreview.rejected_count > 0 || !importPreview.importable_count} onClick={() => void commitAnnotationImport()}>Commit import</button><button type="button" className="button secondary" onClick={() => { setImportFile(null); setImportPreview(null); }}>Cancel</button></div>
+              </div>}
               {selectedVideo && <>
                 <div className="panel timeline-panel"><PanelTitle title="Action timeline" caption={`Half-open intervals · ${barDuration.toFixed(1)} second display scale`} icon={Clock3} />
                   <div className="timeline-axis"><span>0s</span><span>{(barDuration / 2).toFixed(1)}s</span><span>{barDuration.toFixed(1)}s</span></div>
@@ -446,6 +492,17 @@ export default function App() {
           </section>}
 
           {page === "Video & Document Chat" && <KnowledgeWorkspace projectId={projectId} videos={videos} initialVideoId={videoId} />}
+
+          {page === "Data Pipeline" && <section>
+            <div className="section-heading"><div><h2>Local medallion pipeline</h2><p>Build reproducible snapshots from this project's persisted AURA records.</p></div><button className="button primary" disabled={!projectId || !canRunPipeline || pipelineBusy} onClick={() => void runDataPipeline()}><Activity size={16} /> {pipelineBusy ? "Processing…" : "Run pipeline"}</button></div>
+            <div className="simulation-banner"><Activity size={20} /><div><strong>Bronze → Silver → Gold</strong><p>Bronze captures versioned record metadata; Silver normalizes typed annotations and quarantines invalid/duplicate rows; Gold reports label balance, review backlog, overlaps, and export readiness. Outputs use JSON/CSV because no Parquet engine is installed.</p></div></div>
+            {projectId && !canRunPipeline && <div className="limitation-callout">Your assigned role can view pipeline history but cannot start a run. Ask an Administrator, Project Manager, Annotator, Reviewer, or Dataset Manager to run it.</div>}
+            {!projectId ? <EmptyState title="Select a project" message="Choose a project to process its persisted videos and annotations." /> :
+              pipelineRuns.length === 0 ? <div className="panel"><EmptyState title="No pipeline runs yet" message="Run the pipeline to create an immutable snapshot. The same input hash reuses its existing result." /></div> :
+                <div className="panel"><PanelTitle title="Pipeline run history" caption="Persisted under the configured AURA data directory" icon={History} /><div className="table-scroll"><table><thead><tr><th>Batch</th><th>Status</th><th>Bronze</th><th>Silver</th><th>Quarantined</th><th>Started</th></tr></thead><tbody>{pipelineRuns.map((run) => <tr key={run.batch_id}><td><code>{run.batch_id}</code><small>Input {run.input_sha256.slice(0, 12)}…</small></td><td><StatusBadge value={run.status} /></td><td>{run.output_counts.bronze}</td><td>{run.output_counts.silver}</td><td>{run.output_counts.quarantined}</td><td>{readableDate(run.started_at)}</td></tr>)}</tbody></table></div>
+                  {pipelineRuns[0]?.status === "succeeded" && <div className="quality-bottom"><div><h3>Gold analytics</h3><p>{pipelineRuns[0].gold.annotation_count} accepted annotation(s), {pipelineRuns[0].gold.overlapping_intervals} overlapping interval(s).</p><p>Dataset export ready: {pipelineRuns[0].gold.dataset_export_ready ? "yes" : "no"}</p><p>Review status: {Object.entries(pipelineRuns[0].gold.review_status_counts).map(([status, count]) => `${status}: ${count}`).join(" · ") || "no annotations"}</p></div><div><h3>Artifact paths</h3><ul>{Object.entries(pipelineRuns[0].outputs).map(([name, location]) => <li key={name}><code>{name}</code> · <code>{location}</code></li>)}</ul></div></div>}
+                </div>}
+          </section>}
 
           {page === "Simulation" && <section>
             <div className="section-heading"><div><h2>Task-level simulation</h2><p>Phases are mapped directly from saved annotation intervals.</p></div><button className="button primary" disabled={!projectId} onClick={runSimulation}><Boxes size={16} /> Prepare from annotations</button></div>

@@ -1,4 +1,4 @@
-import type { KnowledgeAnswer, KnowledgeConversation, KnowledgeScope, KnowledgeSource, RLExperiment, RLEnvironment } from "../types/models";
+import type { KnowledgeAnswer, KnowledgeConversation, KnowledgeScope, KnowledgeSource, PipelineRun, RLExperiment, RLEnvironment } from "../types/models";
 
 const API_ROOT = "/api/v1";
 
@@ -62,16 +62,19 @@ export const api = {
     return request<any>(`/projects/${projectId}/videos`, { method: "POST", body: data });
   },
   annotations: (videoId: string) => request<any[]>(`/videos/${videoId}/annotations`),
-  importAnnotations: (videoId: string, file: File) => {
+  importAnnotations: (videoId: string, file: File, preview = false) => {
     const data = new FormData();
     data.append("file", file);
-    return request<any>(`/videos/${videoId}/annotations/import`, { method: "POST", body: data });
+    const endpoint = preview ? "import/preview" : "import";
+    return request<any>(`/videos/${videoId}/annotations/${endpoint}`, { method: "POST", body: data });
   },
   createAnnotation: (videoId: string, body: Record<string, unknown>) => request<any>(`/videos/${videoId}/annotations`, json("POST", body)),
   updateAnnotation: (id: string, body: Record<string, unknown>) => request<any>(`/annotations/${id}`, json("PATCH", body)),
   deleteAnnotation: (id: string) => request<any>(`/annotations/${id}`, { method: "DELETE" }),
   validate: (projectId: string) => request<any>(`/projects/${projectId}/validate`, json("POST")),
   quality: (projectId: string) => request<any>(`/projects/${projectId}/quality-summary`),
+  pipelineRuns: (projectId: string) => request<PipelineRun[]>(`/projects/${projectId}/pipeline/runs`),
+  runPipeline: (projectId: string) => request<PipelineRun>(`/projects/${projectId}/pipeline/runs`, json("POST")),
   submitForReview: (projectId: string) => request<any>(`/projects/${projectId}/submit-review`, json("POST")),
   review: (projectId: string, decision: string) => request<any>(`/projects/${projectId}/review`, json("POST", { decision })),
   export: (projectId: string, format: string, include_unapproved: boolean) => request<any>(`/projects/${projectId}/exports`, json("POST", { format, include_unapproved })),
