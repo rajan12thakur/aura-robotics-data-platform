@@ -238,7 +238,7 @@ export default function KnowledgeWorkspace({ projectId, videos, initialVideoId }
             {sources.filter((source) => source.source_type === "video" || !source.video_id || source.video_id === videoId).map((source) => <div className="knowledge-source" key={source.id}>
               <strong>{source.title}</strong>
               <small>{source.source_type} · {source.status} · {source.chunk_count} chunks</small>
-              <small>{source.index_backend}{source.embedding_model ? ` · ${source.embedding_model}${source.embedding_dimensions ? ` (${source.embedding_dimensions}D)` : ""}` : ""}</small>
+              <small>{source.index_backend} · index {source.index_status} · dense {source.dense_index_status}{source.embedding_model ? ` · ${source.embedding_model}${source.embedding_model_revision ? ` @ ${source.embedding_model_revision.slice(0, 8)}` : ""}${source.embedding_dimensions ? ` (${source.embedding_dimensions}D)` : ""}` : ""}</small>
               <small>SHA-256 {source.checksum_sha256.slice(0, 16)}…</small>
               {source.warnings.map((warning) => <small className="knowledge-warning" key={warning}>{warning}</small>)}
               {source.error_summary && <small className="knowledge-error">{source.error_summary}</small>}

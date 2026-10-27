@@ -104,6 +104,10 @@ export interface KnowledgeSource {
   index_backend: string;
   embedding_model: string;
   embedding_dimensions: number | null;
+  embedding_model_revision: string;
+  index_status: "pending" | "processing" | "ready" | "failed" | "stale";
+  dense_index_status: "not_configured" | "pending" | "processing" | "ready" | "failed" | "stale";
+  index_version: number;
   status: "queued" | "processing" | "indexed" | "partially_indexed" | "failed" | "deleted";
   warnings: string[];
   error_summary: string;
@@ -141,6 +145,7 @@ export interface KnowledgeMessage {
       candidate_count: number;
       used_lexical_fallback: boolean;
       embedding_model: string | null;
+      embedding_model_revision?: string | null;
     };
   };
   citations: KnowledgeCitation[];
@@ -170,7 +175,34 @@ export interface KnowledgeAnswer {
     candidate_count: number;
     used_lexical_fallback: boolean;
     embedding_model: string | null;
+    embedding_model_revision?: string | null;
   };
   warnings: string[];
   messages: KnowledgeMessage[];
+}
+
+export interface PipelineRun {
+  batch_id: string;
+  project_id: string;
+  status: "succeeded" | "failed";
+  schema_version: string;
+  source: string;
+  input_sha256: string;
+  input_counts: { videos: number; annotations: number };
+  output_counts: { bronze: number; silver: number; quarantined: number };
+  outputs: Record<string, string>;
+  output_sha256: Record<string, string>;
+  gold: {
+    annotation_count: number;
+    video_count: number;
+    class_balance: Record<string, number>;
+    review_status_counts: Record<string, number>;
+    annotations_per_video: Record<string, number>;
+    annotation_throughput_by_day: Record<string, number>;
+    overlapping_intervals: number;
+    dataset_export_ready: boolean;
+  };
+  started_at: string;
+  duration_ms: number;
+  error_summary: string;
 }

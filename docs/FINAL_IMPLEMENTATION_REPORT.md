@@ -13,21 +13,25 @@ grid-world with tabular Q-learning and a separate baseline evaluation. The
 standalone processor and CLI remain independent of the web server.
 
 The pre-upgrade demo database was backed up and migrated forward without
-replacing its project, video, or eight annotation records. The RAG schema
-backups are `data/aura.db.pre-rag-20261027-010446` and
-`data/aura.db.pre-score-metadata-20261027-012008`. Initial revision snapshots
-and ontology labels were added by a data migration. Authentication is
-implemented but has not received a production security review. OpenAPI,
+replacing its project, video, or eight annotation records. RAG schema backups
+include `data/aura.db.pre-rag-20261027-010446`,
+`data/aura.db.pre-score-metadata-20261027-012008`, and the latest verified
+pre-Phase-B copy `data/aura.db.pre-phase-b-20261027-015700`. Initial revision snapshots
+and ontology labels were added by a data migration. Authentication uses
+Django sessions and has focused regression coverage, but no independent
+production security review. OpenAPI,
 object-level box annotation, real detector/LLM integration, and physical
 simulation are not included.
 
 This report documents the working slices present in the repository; it does
 not claim that the full industrial-platform expansion prompt is complete.
-The grid-world RL slice was added and verified, while medallion processing,
-real model inference, supervised ML, provider-backed agents, dense-vector RAG,
-and the BFSI domain pack remain incomplete as listed below. A follow-on
-annotation/PDF knowledge-chat slice is now implemented and verified in the
-deterministic lexical/extractive mode.
+The grid-world RL slice was added and verified, and local medallion processing
+is implemented. Real model inference, supervised ML, provider-backed agents,
+and the BFSI domain pack remain incomplete as listed below. Video/document chat is
+verified in deterministic lexical/extractive mode. Optional dense-vector
+adapter code and fallback behavior are implemented, but real local embedding
+and Chroma runtime behavior remain unverified because those dependencies and
+a local model are not configured in this environment.
 
 ## Repository changes
 
@@ -42,17 +46,19 @@ deterministic lexical/extractive mode.
 | `docs/system_architecture.md`, `ai_assistant.md`, `cv_pipeline.md`, `simulation.md`, `implementation_status.md` | Created | Architecture and capability boundaries | Implemented |
 | `docs/FINAL_IMPLEMENTATION_REPORT.md` | Created | Actual implementation record and handoff | Implemented |
 | `data/examples/sample_annotations.csv` | Created | Clearly synthetic example records | Implemented |
-| `.env.example`, `pyproject.toml`, `requirements.txt` | Created/updated | Django dependencies and configuration reference | Implemented |
+| `.env.example`, `pyproject.toml`, `requirements.txt` | Created/updated | Django dependencies and configuration reference, including optional embedding model revision | No dependencies added for this phase |
 | `.gitignore` | Updated | Ignores local database, media, exports, and frontend artifacts | Implemented |
 | `backend/aura_api/tests.py` | Created | Focused Django API, authorization, review, import, and release tests | Implemented |
 | `backend/aura_api/management/commands/` | Created | Password-validated local user creation and role assignment | Implemented |
 | `backend/aura_api/rl.py`, `rl_service.py` | Created | Deterministic grid environment, Q-learning, policy evaluation and persistence | Implemented |
-| `backend/aura_api/migrations/0004_rlexperiment.py`–`0007_knowledgechunk_embedding_dimensions_and_more.py` | Created | Additive experiment, checksum, source/chat, embedding dimension, and persisted citation score schema | Implemented |
-| `backend/aura_api/knowledge_service.py`, `models.py`, `views.py` | Added | Private PDF ingestion, actual database annotation indexing, scoped retrieval, persisted chat and citations | Lexical/extractive mode verified; vector extras optional |
-| `src/aura_rag/core.py`, `vector.py` | Added | PDF parser/chunker, lexical ranking, local embedding and persistent Chroma adapters | Core verified; Chroma/embedding runtime not installed |
+| `backend/aura_api/migrations/0004_rlexperiment.py`–`0008_knowledgechunk_embedding_model_revision_and_more.py` | Created | Additive experiment, checksum, source/chat, embedding provenance/index version, and persisted citation score schema | Implemented; 0008 applied after verified DB backup |
+| `backend/aura_api/knowledge_service.py`, `models.py`, `views.py` | Added | Private PDF ingestion, actual database annotation indexing, scoped retrieval, persisted chat/citations, revision-aware dense fallback | Lexical/extractive mode verified; vector extras optional |
+| `src/aura_rag/core.py`, `vector.py`, `evaluation.py` | Added | PDF parser/chunker, lexical ranking, optional local embedding/Chroma adapters, and synthetic lexical evaluation | Lexical and fake-adapter paths verified; Chroma/embedding runtime not installed |
+| `backend/aura_api/management/commands/aura_evaluate_knowledge.py`, `data/examples/rag_retrieval_evaluation.json` | Added | Bounded offline evaluation over synthetic positive/negative retrieval cases | Lexical fixture only; not a dense model benchmark |
 | `frontend/src/KnowledgeWorkspace.tsx`, typed API models/client | Added | Source management, evidence scope, persistent conversations and citations | Production build passed; browser workflow not performed |
+| `backend/aura_api/data_pipeline.py`, CLI/API, typed frontend models and page | Added | Project-scoped Bronze/Silver/Gold JSON/CSV, quarantine, metrics, lineage and retry | Backend tests and frontend production build; no database schema added |
 | `docs/REINFORCEMENT_LEARNING.md` | Created | Environment, rewards, reproducibility, workflow and limits | Implemented |
-| `docs/AI_AGENT_AND_RAG.md`, `docs/IMPLEMENTATION_STATUS.md` | Added/updated | Current RAG behavior, Phase 0 audit, capability ledger and known limitations | Implemented |
+| `docs/AI_AGENT_AND_RAG.md`, `docs/IMPLEMENTATION_STATUS.md` | Added/updated | RAG behavior, audit, Phase A/B evidence, capability ledger and limitations | Implemented |
 | `data/examples/synthetic_robot_operating_guideline.pdf` | Added | One-page fictional retrieval fixture; no real customer or robot data | pypdf text extraction verified |
 | `README.md` | Updated | Setup, usage, workflow, and limitations | Implemented |
 | `AURA_MASTER_IMPLEMENTATION_PROMPT.md`, `LICENSE` | Preserved | Existing user-provided specification and license | Unchanged |
@@ -74,6 +80,8 @@ No changes were committed or pushed. The requested branch remains
   through the local `/api` proxy.
 - **Media and exports:** generated managed-media keys under `data/media/`;
   artifacts under `output/exports/` and reports under `output/reports/`.
+  Project-scoped medallion outputs are isolated under configurable
+  `AURA_PIPELINE_DIR` (`data/pipelines/` by default).
 - **Assistant/retrieval:** the existing deterministic policy assistant plus
   a scoped Video & Document Chat. The latter parses PDF text, indexes actual
   video/annotation/validation records, stores chunks/messages/citations and
@@ -84,6 +92,10 @@ No changes were committed or pushed. The requested branch remains
 - **Simulation:** persisted task representation and phase advancement derived
   from stored annotations; no physics or robot control. A separate tabular RL
   experiment uses its own deterministic 3×3 grid environment.
+- **Medallion pipeline:** bounded ORM snapshots, normalized/quarantined
+  annotation rows, Gold quality summaries, checksummed JSON/CSV artifacts,
+  failure manifests, and retryable idempotent batches. No queue, Parquet,
+  distributed processing, or ORM job table is included.
 
 ## Features implemented
 
@@ -96,11 +108,13 @@ No changes were committed or pushed. The requested branch remains
 | Human review | Draft submission, reviewer role, maker-checker guard, reasoned rejection, fresh validation, append-only review snapshots | UI exposes project-level submission/approval, not a detailed per-record adjudication queue |
 | Audit | Append-oriented event history for consequential workflows | Not tamper-evident against a local machine administrator |
 | Export | Immutable project release versions, approved-only by default, explicit draft export, source snapshot, manifest and download checksum validation | No external registry or cryptographic signing; JSON/CSV only |
+| Data Pipeline | Authenticated project API, Data Pipeline workspace, and `aura_run_pipeline` CLI; Bronze JSON, Silver JSON/CSV, quarantine reasons, Gold metrics, SHA-256 lineage, verified idempotency and retry | Local synchronous execution, maximum 100,000 active annotations, no Parquet/queue/job table |
 | Ontology | Versioned v1 action labels, descriptions/rules, API read endpoint, annotation schema binding | Seeded vocabulary only; ontology editing/version administration UI deferred |
 | Authentication | Django session login/logout, CSRF-protected mutations, role groups and server-side write/review/export checks | Local account provisioning; no rate limiting, SSO, password reset, or external security review |
+| Admin and workspace identity | Separate AURA login form and Django admin route; both use Django sessions, verified by an admin-login-to-API test | Browser cookies are host-scoped; logging into admin on `127.0.0.1` is not shared with a UI opened under `localhost`; global roles only |
 | Operations | Request IDs, public liveness/readiness endpoints and database/storage checks | Does not replace deployment monitoring |
 | Assistant | Deterministic policy, validation and project-summary intents with evidence metadata | No natural-language model; unsupported questions receive a limitation |
-| Video & Document Chat | Private PDF ingestion, checksum and page-level chunks; video metadata/annotation indexing; selected-video/PDF/project scopes; saved conversations; citation snapshots and retrieval scores; abstention; retry and removal | Current active retrieval is lexical SQLite. No Chroma runtime/model, OCR, LLM, LangChain, PDF viewer, frame seeking, or project-membership ACL |
+| Video & Document Chat | Private PDF ingestion, checksum and page-level chunks; video metadata/annotation indexing; selected-video/PDF/project scopes; saved conversations; citation snapshots and retrieval scores; abstention; retry/removal; optional revision-aware dense adapter with lexical fallback | Current active retrieval is lexical SQLite. No Chroma runtime/model, OCR, LLM, LangChain, PDF viewer, frame seeking, or project-membership ACL |
 | Synthetic demo | Explicit, idempotent **Load synthetic demo** action; eight synthetic draft segments and no real video | Demo records are not human labels and have no playable video |
 | Simulation | Prepare, start/advance and reset a stored task sequence from annotation IDs/timestamps | Scripted task-state display only; no physical robot, geometry or physics |
 | Reinforcement learning | Seeded tabular Q-learning, persisted Q-table/configuration/metrics, policy checksum, and separate evaluation against a rule-based baseline | Tiny fixed-layout grid; bounded synchronous runner; not physical control or annotation-trained behavior |
@@ -182,20 +196,24 @@ The following checks were performed after the upgrade:
 | Django configuration | Passed | `python manage.py check` reported no issues |
 | Migration consistency | Passed | `python manage.py makemigrations --check --dry-run` reported no changes |
 | Database migration | Passed | Forward migration `0006_knowledgechunk_knowledgeconversation_and_more` applied after timestamped backup |
-| Database migration | Passed | Forward migration `0007_knowledgechunk_embedding_dimensions_and_more` applied after timestamped backup |
-| Preserved data and migration backfill | Passed | SQLite still has `synthetic-demo-project`, `demo-video-001`, 8 original annotations, 8 initial revision snapshots, and 10 ontology labels |
+| Database migration | Passed | Forward migration `0008_knowledgechunk_embedding_model_revision_and_more` applied after verified timestamped backup |
+| Preserved data and migration backfill | Passed | Read-only comparison of all `aura_api_*` primary-key ID sets before/after 0008: unchanged; project 1, video 1, annotations 8, revisions 8, ontology labels 10, assistant interactions 1, audit events 17, simulation runs 6, validation runs 1; exports/RL/knowledge records zero |
 | Python source compilation | Passed | `python -m compileall -q backend src` completed without errors |
-| Focused Django API tests | Passed | `python manage.py test aura_api.tests --verbosity 2`: 18 tests passed, 0 failures |
+| Focused Django API tests | Passed | `.\\.venv\\Scripts\\python.exe manage.py test aura_api.tests --verbosity 2`: 27 tests passed, 0 failures |
+| Authentication regression tests | Passed | CSRF rejection, invalid credentials, session persistence/cookie flags, logout invalidation, protected endpoint rejection, and Django admin/API shared-session behavior are covered |
+| CORS preflight | Passed | Allowed frontend origin returns 200 with credentials and `x-csrftoken`; covered by `test_frontend_origin_cors_preflight_allows_credentials_and_csrf_header` |
+| HTTP authentication/admin smoke | Passed | Live local server: `/api/v1/health` returned 200, anonymous `/api/v1/auth/me` returned 401, and `/admin/` redirected to `/admin/login/` with 302 |
 | Authentication/authorization | Passed | Tests verify CSRF-protected login, unauthenticated rejection, role-gated project/export writes, and readiness diagnostics |
 | Annotation/review workflow | Passed | Tests verify interval/ontology validation, atomic import, maker-checker, draft submission, reviewer approval, and revision snapshots |
 | Release/export workflow | Passed | Tests verify approved-only CSV, monotonic release versions, repeatable CSV/JSON artifact checksums, authorized download, and tamper detection |
 | RL environment/learning | Passed | Tests verify transition/reward semantics, seeded Q-table reproducibility, role-gated API persistence, separate 20-episode evaluation, and policy checksum |
 | PDF/video knowledge workflow | Passed in lexical mode | API tests ingest an actual generated text PDF, verify SHA-256/page provenance, duplicate rejection, encrypted/corrupt/empty-text outcomes, retry versioning, persisted citation scores, actual annotation ID/time citations, cross-project scoping, abstention, and source deletion |
 | Synthetic PDF fixture | Passed | `python manage.py aura_create_synthetic_guideline`; `pypdf` extracted its one-page text |
-| ChromaDB persistence / dense embeddings | Not run | Optional `rag` extra and model are not installed; runtime capability reports `lexical_sqlite` |
+| ChromaDB persistence / dense embeddings | Not run | Optional `rag` extra and model are not installed; fake-provider tests cover metadata, scoped results, mismatch fallback, invalid vectors and legacy deletion; runtime capability remains lexical-only |
+| Synthetic retrieval fixture | Passed | `aura_evaluate_knowledge --top-k 3`: recall@3 1.0, citation precision 0.6, negative abstention 1.0 over 3 positive and 1 negative synthetic questions; lexical-only fixture, not a dense benchmark |
 | RAG browser walkthrough | Not run | UI production build passed; no live browser session was performed |
 | Seeded RL runtime smoke | Passed | `run_experiment('q_learning', episodes=500, seed=7, max_steps=40)`: 0.81 training success rate; learned and baseline evaluation success rates were both 1.0; policy SHA-256 emitted |
-| Frontend typecheck/production build | Passed | `npm run build` ran `tsc -b` and Vite successfully |
+| Frontend typecheck/production build | Passed | `Set-Location frontend; npm run build` ran `tsc -b` and Vite successfully |
 | Standalone CLI | Passed | `annotation-processor validate data/examples/sample_annotations.csv`: 8 records, no issues |
 | Browser/manual UI inspection | Not performed | No browser interaction check was run; frontend verification was build/typecheck only |
 | PostgreSQL runtime | Not performed | Settings and optional driver profile are implemented; checks used SQLite |
@@ -228,9 +246,9 @@ missing TypeScript response field; the API type was updated and the subsequent
   downloaded; no detector adapter exists.
 - The assistant is deterministic and has limited intent matching. No LLM
   provider or model evaluation is implemented.
-- There is no Bronze/Silver/Gold pipeline or durable transformation/retry
-  framework yet. Media remains in local managed storage; normalized and
-  approved datasets are not materialized as medallion data products.
+- The medallion pipeline is local and synchronous. It does not have queued or
+  scheduled workers, a durable database job table, Parquet output, split
+  leakage validation, or advanced inter-annotator agreement analytics.
 - No real object detector/YOLO adapter ran. No supervised model, DQN,
   behavior cloning, or model registry was implemented or exercised.
 - The RL lab is a 3×3 fixed-layout task environment with tabular Q-learning.
@@ -275,9 +293,7 @@ missing TypeScript response field; the API type was updated and the subsequent
 7. Annotation-level review/adjudication interface, ontology management,
    object boxes/tracks, simulation run discovery after refresh, and video
    archival controls in the frontend.
-8. Bronze/Silver/Gold processing with durable pipeline jobs, quarantine,
-   retries, lineage and Parquet products.
-9. Real detector inference, supervised ML baseline/registry, optional DQN,
+8. Real detector inference, supervised ML baseline/registry, optional DQN,
    dense Chroma/local-embedding RAG verification, safe LLM/agent tooling, and
    the isolated BFSI document pack.
 
@@ -311,7 +327,11 @@ review, export, and deterministic-assistant workflow coherent.
     about each source, inspect page/time citations, then ask an unsupported
     question and observe abstention. State that this checkout uses lexical
     retrieval, not dense vector search, and that the video pixels are absent.
-11. For a data-quality failure demo, submit an invalid interval or unknown
+11. In **Data Pipeline**, run `python manage.py aura_run_pipeline --project-id
+    synthetic-demo-project`; inspect its summary and output hashes, then rerun
+    unchanged input to demonstrate verified idempotent reuse. The local
+    artifacts are under `data/pipelines/` by default.
+12. For a data-quality failure demo, submit an invalid interval or unknown
    action through API/import and show that the request is rejected atomically.
 
 Provision the independent demo roles from another backend terminal before
@@ -337,7 +357,7 @@ python manage.py aura_assign_role dataset_manager "Dataset Manager"
 | 6:30–7:15 | Ask a supported assistant question and inspect its local deterministic evidence citation. State that no provider LLM or vector index is active. |
 | 7:15–8:00 | Show the annotation-derived task visualization and its explicit no-physics/no-control boundary. |
 | 8:00–9:30 | In the RL lab, train Q-learning with a fixed seed, inspect the rolling training curve, and compare learned and baseline policy on separate evaluation episodes. Explain that these are simulator rewards, not labels or robot trials. |
-| 9:30–10:00 | Show the RL run record, configuration, and Q-table checksum; finish by naming deferred medallion, CV, RAG, ML/DQN, BFSI, and hardware work. |
+| 9:30–10:00 | Run the project Data Pipeline; inspect quarantine, Gold metrics and the content-addressed manifest. Repeat without edits to demonstrate reuse, and state remaining CV, dense-runtime, ML/DQN, BFSI and hardware limitations. |
 
 Use the preloaded synthetic project only for demonstration convenience. Do not
 claim that the RL policy improves on baseline unless the displayed persisted
@@ -352,3 +372,94 @@ evaluation metrics show that result for the run being presented.
   complete an independent security review.
 - OpenAPI docs, full browser tests, detector inference, provider LLM,
   object-level annotation, and physical simulation remain deferred.
+- The pipeline uses existing installed packages only; no optional dependency
+  was added. No pipeline was run against the active user database.
+
+## Latest continuation: Phase A complete; Phase B adapter work validated
+
+The latest working tree remains on `feature/1-initialize-aura-platform`; no
+commit, push, or merge was made. Authentication checks confirmed the AURA
+login form is independent UI while sharing Django sessions with `/admin/`.
+Phase B added an optional dense retrieval adapter, index/model provenance,
+stale-model fallback, lexical evaluation and truthful frontend index status.
+ChromaDB and sentence-transformers are absent and no local model is
+configured, so only the adapter's fake-provider tests and lexical fallback
+were verified. At that Phase B handoff, later phases had not started.
+
+Before applying migration 0008, a byte-for-byte backup was verified at
+`data/aura.db.pre-phase-b-20261027-015700` (602,112 bytes,
+SHA-256 `5D6074C255F530AE4CD4E52B3076384F9CF77754D9559290F5A002B6C1413BCD`).
+Read-only primary-key comparisons against that backup found every
+`aura_api_*` table's IDs unchanged after migration, including the synthetic
+project `synthetic-demo-project`, video `demo-video-001`, all eight
+annotations and revisions, ten ontology labels, and the original audit and
+simulation records. No exports, RL experiments, or knowledge records were
+added to the configured database.
+
+Phase B verification:
+
+```powershell
+.\.venv\Scripts\python.exe manage.py check
+.\.venv\Scripts\python.exe manage.py makemigrations --check --dry-run
+.\.venv\Scripts\python.exe manage.py test aura_api.tests --verbosity 2
+.\.venv\Scripts\python.exe -m compileall -q backend src
+git diff --check
+Set-Location frontend; npm run build
+.\.venv\Scripts\python.exe manage.py aura_evaluate_knowledge --top-k 3
+```
+
+Those phase checks passed: 27 Django tests, no pending migrations, clean Python
+compilation/diff check, and frontend TypeScript/Vite production build. The
+synthetic lexical evaluation returned recall@3 `1.0`, citation precision
+`0.6`, and negative abstention `1.0` for three positive and one negative
+question. A local HTTP smoke returned 200 for health and 401 for anonymous
+`/api/v1/auth/me`; no browser walkthrough was performed.
+
+## Current continuation: video integrity and medallion pipeline
+
+Managed video upload checks basic container signatures and streams bounded
+byte ranges. Annotation import now supports a read-only preview, duplicate
+reporting, and duplicate skipping after server-side commit revalidation. A
+project-scoped, bounded pipeline writes Bronze JSON, typed/deduplicated Silver
+JSON/CSV, quarantine reasons, Gold metrics, and input/output SHA-256 lineage.
+Successful outputs are reused only after all stored checksums verify;
+corrupted/missing outputs are regenerated and failed output runs are recorded
+for retry. The CLI, authenticated API, audit events, React workspace, and
+`AURA_PIPELINE_DIR` configuration are wired. Generated artifacts are ignored
+under `data/pipelines/` by default. No optional Python package or schema
+migration was added.
+
+Current verification used:
+
+```powershell
+.\.venv\Scripts\python.exe manage.py test aura_api.tests --verbosity 2
+.\.venv\Scripts\python.exe manage.py check
+.\.venv\Scripts\python.exe manage.py makemigrations --check --dry-run
+.\.venv\Scripts\python.exe manage.py showmigrations
+.\.venv\Scripts\python.exe -m compileall -q backend src
+git diff --check
+Set-Location frontend; npm run build
+```
+
+The complete Django suite passed 33 tests; Django checks, migration
+consistency, compilation, whitespace validation, and the production frontend
+build passed. Targeted pipeline/import/upload tests also passed. All recorded
+migrations through `aura_api.0008` are applied. No live browser walkthrough
+was performed, and the pipeline CLI was not run against the active database.
+
+The active SQLite database was inspected read-only. Current counts were:
+1 project, 3 videos, 8 annotations, 8 revisions, 10 ontology labels, 0
+exports, 0 RL experiments, 1 knowledge source, 0 conversations, and 20 audit
+events. The project ID and all eight annotation IDs match the documented
+inventory; the video table still includes `demo-video-001`. An earlier
+inventory recorded 0 knowledge sources and 19 audit events. The origin of
+that source/audit delta is not established by this run, so it is not
+attributed to this implementation. No active-database write, migration,
+pipeline run, reset, or seed operation was performed during this
+continuation.
+
+Remaining work includes actual configured dense embeddings/Chroma validation,
+provider-backed RAG and safe agent tools, real CV inference, supervised ML,
+DQN, the isolated synthetic BFSI workflow, production hardening, and browser
+walkthroughs. The local medallion slice is not a queued Parquet/distributed
+ETL platform.

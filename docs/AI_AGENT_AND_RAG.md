@@ -9,10 +9,12 @@ project-scoped chunks using lexical overlap. It is labelled as lexical search;
 it is not presented as vector similarity or as a generated LLM response.
 
 The optional persistent ChromaDB and sentence-transformers adapters are
-implemented behind lazy interfaces. They are not part of the base install,
-were not installed or exercised in this run, and no embedding model is
-configured. When a local model path and both optional packages are available,
-the ingestion service can store embeddings in a persistent Chroma collection.
+implemented behind lazy interfaces. They were not installed or exercised in
+this run, and no embedding model is configured. Dense indexes are isolated by
+embedding model name and revision. When a local model path and both optional
+packages are available, the ingestion service validates vector counts,
+dimensions and finite values before recording a ready dense index. Failed
+dense indexing keeps the lexical ORM index available and reports the failure.
 No model is downloaded or loaded at application startup. Chroma telemetry is
 disabled in the local adapter.
 
@@ -26,10 +28,12 @@ inspection.
 
 - `KnowledgeSource` records a project-scoped PDF or video evidence source,
   source version, checksum, state, page/chunk counts, backend/model label,
-  warnings, and sanitized error summary.
+  lexical and dense index states, index version, model revision, warnings,
+  and sanitized error summary.
 - `KnowledgeChunk` stores normalized text in Django, stable ID/checksum,
-  PDF-page or video-time/annotation provenance, source type, and indexing
-  backend. The ORM is authoritative; Chroma is an optional derived index.
+  source checksum and index version, PDF-page or video-time/annotation
+  provenance, source type, and indexing backend. The ORM is authoritative;
+  Chroma is an optional derived index.
 - `KnowledgeJob` records synchronous indexing lifecycle, timestamps, retry
   count, counts, and safe error details. The HTTP request waits for this
   bounded work; it is not represented as an asynchronous worker.
@@ -65,7 +69,10 @@ python manage.py aura_create_synthetic_guideline
 
 Upload the fixture through **Video & Document Chat**. PDFs may be project-wide
 or associated with the currently selected video. The source list displays
-index state, chunk count, checksum prefix, warnings and retrieval backend.
+lexical and dense index states, model revision, chunk count, checksum prefix,
+warnings and retrieval backend. Each answer records its actual retrieval mode;
+dense local search is identified as `dense_local`, and lexical fallback as
+`lexical_sqlite`.
 Retry/re-index and removal are explicit actions. Uploading and indexing run
 synchronously in the local API request, so large documents may take time.
 
@@ -132,26 +139,37 @@ save it to an ignored local directory:
 python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('sentence-transformers/all-MiniLM-L6-v2').save('data/models/all-MiniLM-L6-v2')"
 $env:AURA_EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 $env:AURA_EMBEDDING_MODEL_PATH = (Resolve-Path "data/models/all-MiniLM-L6-v2").Path
+$env:AURA_EMBEDDING_MODEL_REVISION = "all-MiniLM-L6-v2-local-1"
 $env:AURA_VECTOR_STORE_DIR = (Join-Path (Get-Location) "data/vector_store")
 ```
 
 The explicit command may access the model source to download files; it is not
-run by application startup. Keep model files and the Chroma directory private
-and out of source control. Once configured, re-index existing sources with
-`python manage.py aura_reindex_knowledge --source-id <source-id>`. Embedding
-work is CPU-first; memory/time requirements depend on the chosen model.
+run by application startup. The explicit revision is stored with each index;
+if omitted, AURA derives a local fingerprint from the model directory's file
+names, sizes, and modification times. Keep model files and the Chroma
+directory private and out of source control. Once configured, re-index existing sources with
+`python manage.py aura_reindex_knowledge --source-id <source-id>`. The model
+loads lazily on first indexing/retrieval and is cached for that server process.
+Embedding work is CPU-first; memory/time requirements depend on the chosen
+model.
 
 Check capability mode without exposing source content:
 
 ```powershell
 Invoke-RestMethod http://127.0.0.1:8000/api/v1/config/capabilities
 python manage.py aura_knowledge_status
+python manage.py aura_evaluate_knowledge --top-k 3
 ```
 
 The current checked-out environment has `pypdf` 6.21.2 installed; ChromaDB
 and sentence-transformers are absent. Therefore current operation uses
-`lexical_sqlite`. Dense retrieval and Chroma restart persistence remain
-unverified until the optional setup above is intentionally performed.
+`lexical_sqlite`. The evaluation command runs a small synthetic lexical
+fixture and reports computed recall@k, citation precision, and negative
+abstention rate; it is not a dense-model benchmark. Dense retrieval and Chroma
+restart persistence remain unverified until the optional setup above is
+intentionally performed. Retrieval permissions are applied in the ORM scope
+before querying and are revalidated against current ORM chunk IDs and source
+hash/index versions before citation.
 
 ## Privacy, deletion and backup
 

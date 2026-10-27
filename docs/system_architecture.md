@@ -14,6 +14,7 @@ Browser → typed API client → Django views → Django ORM → SQLite
                                   ├→ annotation_processor
                                   ├→ canonical policy document retrieval
                                   ├→ aura_rag parsing/chunking + optional Chroma adapter
+                                  ├→ Bronze/Silver/Gold local pipeline artifacts
                                   ├→ data/media (managed upload only)
                                   └→ output/exports (downloadable artifact)
 ```
@@ -66,6 +67,24 @@ non-user-controlled keys, and store a SHA-256 checksum. OpenCV is optional for
 metadata and bounded frame metadata. No preview files/detector adapter are
 provided. Exports are deterministic-order CSV/JSON files with a lineage
 manifest and content checksum; default export includes approved records only.
+
+## Medallion pipeline
+
+The project-scoped pipeline reads video metadata and non-archived annotation
+records through the Django ORM. It writes an input-hash-addressed Bronze JSON
+snapshot, normalized Silver JSON/CSV rows, a quarantine JSON file with
+validation reasons, Gold annotation/review/class-balance/overlap metrics, and
+a run manifest with input/output hashes and counts. Identical project input
+reuses the successful batch only when every expected artifact still matches
+its recorded checksum; modified or missing artifacts are regenerated.
+Artifacts are written atomically beneath `AURA_PIPELINE_DIR` (default
+`data/pipelines/`), are ignored by Git, and do not contain uploaded media,
+annotation notes, or private storage keys. The bounded synchronous service
+supports up to 100,000 active annotations per project; outputs are local
+JSON/CSV, not Parquet, and run metadata is in manifests rather than a database
+job table. Use `python manage.py aura_run_pipeline --project-id <id>` or the
+authenticated project API; the React Data Pipeline workspace exposes the
+same operation and persisted manifest history.
 
 ## Simulation
 
